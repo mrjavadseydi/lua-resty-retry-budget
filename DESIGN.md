@@ -542,7 +542,7 @@ BSD 2-clause `LICENSE`. `dist.ini` for OPM. A rockspec with the same version. `M
 
 ## Implementation order
 
-Paused here for review.
+Shipped in this order.
 
 1. `budget` + `histogram` + `backoff` + `deadline`, with busted tests.
 2. Client sequential retries, then hedge, each with the Test::Nginx files that cover them.
