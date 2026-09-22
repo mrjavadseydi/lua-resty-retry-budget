@@ -17,8 +17,8 @@ need `resty.core.shdict` (loaded by default in OpenResty 1.21).
 ## Install
 
 ```bash
-opm get ledgetech/lua-resty-http
-# copy lib/ into your lua_package_path, or:
+luarocks install lua-resty-retry-budget   # pulls in lua-resty-http
+# or, from a checkout:
 luarocks make lua-resty-retry-budget-0.1.0-1.rockspec
 ```
 

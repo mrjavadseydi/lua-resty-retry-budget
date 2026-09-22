@@ -10,12 +10,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: leafo/gh-actions-lua@v10
+      - uses: leafo/gh-actions-lua@v11
         with:
-          luaVersion: luajit-2.1.0-beta3
-      - uses: leafo/gh-actions-luarocks@v4
+          luaVersion: luajit-openresty
+      - uses: leafo/gh-actions-luarocks@v5
       - name: Install busted
         run: luarocks install busted
+      - name: Rockspec builds and installs
+        run: luarocks make lua-resty-retry-budget-0.1.0-1.rockspec
       - name: Unit tests and global-write check
         run: |
           make test
