@@ -6,7 +6,7 @@ local _M = {}
 
 local worker_next = {}
 
-function _M.warn(dict, name, code, msg, now)
+function _M.warn(dict, name, code, msg, now, level)
     local key = "rb:" .. name .. ":log:" .. code
     local ok, err
     if dict then
@@ -29,8 +29,10 @@ function _M.warn(dict, name, code, msg, now)
     end
 
     local n = ngx
-    if n and n.log and n.WARN then
-        n.log(n.WARN, "[retry-budget] key=", name, " ", msg)
+    if n and n.log then
+        -- ERR rather than WARN: nginx may block-buffer warn lines, and a
+        -- dict failure means the budget may no longer be enforcing.
+        n.log(level or n.ERR or n.WARN, "[retry-budget] key=", name, " ", msg)
     end
 end
 
