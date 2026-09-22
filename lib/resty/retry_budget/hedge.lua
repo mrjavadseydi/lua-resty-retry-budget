@@ -74,7 +74,8 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
         -- dropped by ngx.thread.wait, and the later fields slide left.
         slot.thread = ngx.thread.spawn(function()
             local ok, res, err, httpc, sample_ms, sample_kind, class =
-                pcall(client.attempt, client, uri, params, deadline_ms, slot)
+                pcall(client.attempt, client, uri, params, deadline_ms, slot,
+                      start)
             if not ok then
                 if slot.httpc then
                     slot.httpc.keepalive = false
@@ -131,16 +132,22 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
     local function arm_timer(ms)
         local remain = deadline.remaining_ms(deadline_ms, start, client.clock())
         local sleep_ms = ms
+        local hit_deadline = false
         if remain and remain < sleep_ms then
             sleep_ms = remain
+            hit_deadline = true
         end
         if not sleep_ms or sleep_ms < 1 then
+            meta.deadline_exceeded = true
             return
         end
         timer = ngx.thread.spawn(function()
             local ok, err = pcall(ngx.sleep, sleep_ms / 1000)
             if not ok then
                 return { id = 0, err = err }
+            end
+            if hit_deadline then
+                return { id = 0, deadline = true }
             end
             return { id = 0 }
         end)
@@ -192,9 +199,13 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
 
         if who == 0 then
             timer = nil
+            local remain = deadline.remaining_ms(deadline_ms, start, client.clock())
+            local at_deadline = pkt.deadline or (remain and remain < 1)
             local primary = slots[1]
-            if primary and not primary.reaped and spawned < client.max_attempts
-                and hedges < max_hedges then
+            if at_deadline then
+                meta.deadline_exceeded = true
+            elseif primary and not primary.reaped
+                and spawned < client.max_attempts and hedges < max_hedges then
                 if client.budget:try_acquire() then
                     hedges = hedges + 1
                     client.budget:record_hedge_sent()
@@ -214,6 +225,9 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
             kill_timer()
             if sample_kind == "response" or sample_kind == "timeout" then
                 client.estimator:record(sample_ms)
+            end
+            if class == "deadline" then
+                meta.deadline_exceeded = true
             end
             if client:response_wins(res, err, bad_waits) then
                 for id, other in pairs(slots) do

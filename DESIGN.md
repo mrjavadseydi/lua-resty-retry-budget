@@ -99,9 +99,10 @@ Counter kinds for one budget over a 10s window: ~60 keys. Histogram default: 6 s
 
 Name registration in `new()`:
 
-1. `add(P.."n", "1")`. If it fails because the key exists, this name is already indexed; stop.
-2. `add("rb:\0lock", "1", 1)`. On success, append `name .. "\n"` to `rb:\0names` if absent, then `delete` the lock.
-3. If the lock is busy, leave the marker. The next `new()` of the same name retries the index update. `stats()` unions the dict index with names constructed in this worker, so a lock miss does not hide a local budget.
+1. `add(P.."n", "1")`. The marker means registration has started. `"exists"` is not proof the index contains the name.
+2. If `rb:\0names` already lists the name, stop.
+3. `add("rb:\0lock", "1", 1)`. On success, re-read the index, append `name .. "\n"` if absent, then `delete` the lock.
+4. If the lock is busy, leave the marker and return. The next `register_name` of that name tries the index again. `stats()` unions the dict index with names constructed in this worker, so a lock miss does not hide a local budget, and a later registration publishes it to other workers.
 
 ## Budget algorithm
 
@@ -271,7 +272,9 @@ Deadline (`deadline_ms` on the client, overridable per `request_uri`):
 remaining_ms = deadline_ms - (clock() - start) * 1000
 ```
 
-Before a retry sleep: if `delay_ms >= remaining_ms`, do not `try_acquire` and do not sleep. Stop. A retry token is acquired only after the delay is known to fit, and before `ngx.sleep`.
+`start` is the `request_uri` call. Every connect, send, receive, retry sleep, and hedge delay uses that same origin. An attempt does not take a fresh `deadline_ms`. Before a retry sleep: if `delay_ms >= remaining_ms`, do not `try_acquire` and do not sleep. Stop. A retry token is acquired only after the delay is known to fit, and before `ngx.sleep`.
+
+The hedge timer sleeps `min(delay, remaining)`. If that sleep ends because the deadline was reached, it does not `try_acquire` and does not spawn another attempt. `meta.deadline_exceeded` is set. A deadline failure on a hedged attempt sets the same flag, including when the call then falls through to the sequential loop.
 
 `settimeouts(connect, send, read)` does not enforce the deadline. Each value is an idle timeout for that operation, and the read timer is re-armed on every `receive`. An upstream that writes one byte every 900 ms keeps the attempt alive past any sum of the three configured timeouts. The client calls `sock:settimeout(ms)` immediately before `connect`, before `send`, and before every `receive` (status line, each header line, each body read). `ms = min(configured_for_that_op, remaining_ms)`. `sock:settimeout` writes that one value into the connect, send, and read slots; calling it immediately before the operation makes the next op use the wall-clock remainder. If `remaining_ms < 1`, the attempt stops, the socket is closed, and `meta.deadline_exceeded` is set. `settimeout(0)` is not used. The pure helper is `next_timeout_ms(remaining, configured) -> ms or nil`.
 
@@ -481,11 +484,11 @@ Peers are resolved before the balancer phase (cosockets and DNS are illegal ther
 
 The four fields in the task (`requests`, `retries`, `allowed_ratio`, `rejected`) are always present. The rest are the observability set. `allowed_ratio` is the configured ratio; the floor is visible through `allowance` (with zero traffic, `allowance == 100` while `allowed_ratio == 0.2`).
 
-`rb.stats()` returns `{ [name] = budget:stats() }` for every indexed name. Percentiles are nil until an estimator for that name has samples. The client constructs the estimator. A budget-only user who wants percentiles constructs `new_estimator` with the same name and dict.
+`rb.stats()` returns `{ [zone] = { [name] = budget:stats() } }` for every indexed name. The zone is the shared-dict name, so the same budget name in two zones does not overwrite. `budget:stats()` includes `dict` with that zone name. Percentiles are nil until an estimator for that name has samples. The client constructs the estimator. A budget-only user who wants percentiles constructs `new_estimator` with the same name and dict.
 
 `resty.retry_budget.prometheus.register(prom, { dict = "retry_budget" })` soft-depends on `knyar/nginx-lua-prometheus` via `pcall(require, "prometheus")`. The caller passes an already constructed prometheus object (that library owns a dict and an `init_worker` sync; this one must not invent a second). `register` creates gauges. `observe()` sets them from `rb.stats()` and is called from the scrape location **before** `prom:collect()`. Window values are gauges, not lifetime counters, so `rate()` is the wrong function; the number is already a window count. Hot path does not call prometheus.
 
-Gauges: `retry_budget_requests_window`, `retry_budget_retries_window`, `retry_budget_retries_rejected_window`, `retry_budget_hedges_sent_window`, `retry_budget_hedges_won_window`, `retry_budget_dict_errors_window`, `retry_budget_latency_ms` with labels `budget` and, for latency, `quantile` in `{"0.5","0.95","0.99"}`.
+Gauges: `retry_budget_requests_window`, `retry_budget_retries_window`, `retry_budget_retries_rejected_window`, `retry_budget_hedges_sent_window`, `retry_budget_hedges_won_window`, `retry_budget_dict_errors_window`, `retry_budget_latency_ms`. Every gauge is labeled `budget` and `dict` (the shared-dict zone). Latency also has `quantile` in `{"0.5","0.95","0.99"}`. When a percentile is nil, `observe` sets that series to NaN so an expired window does not keep the previous value.
 
 ## Non-HTTP use
 

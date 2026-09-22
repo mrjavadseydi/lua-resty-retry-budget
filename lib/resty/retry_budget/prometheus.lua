@@ -26,25 +26,25 @@ function _M.register(prom)
     gauges = {
         requests = inst:gauge("retry_budget_requests_window",
             "Original requests in the current retry-budget window",
-            { "budget" }),
+            { "budget", "dict" }),
         retries = inst:gauge("retry_budget_retries_window",
             "Retries and hedges withdrawn in the current window",
-            { "budget" }),
+            { "budget", "dict" }),
         rejected = inst:gauge("retry_budget_retries_rejected_window",
             "Retries refused by the budget in the current window",
-            { "budget" }),
+            { "budget", "dict" }),
         hedges_sent = inst:gauge("retry_budget_hedges_sent_window",
             "Hedge attempts sent in the current window",
-            { "budget" }),
+            { "budget", "dict" }),
         hedges_won = inst:gauge("retry_budget_hedges_won_window",
             "Hedge attempts that won in the current window",
-            { "budget" }),
+            { "budget", "dict" }),
         dict_errors = inst:gauge("retry_budget_dict_errors_window",
             "Shared dict failures in the current window",
-            { "budget" }),
+            { "budget", "dict" }),
         latency = inst:gauge("retry_budget_latency_ms",
             "Latency percentile in the current histogram window",
-            { "budget", "quantile" }),
+            { "budget", "dict", "quantile" }),
     }
     return true
 end
@@ -59,23 +59,22 @@ function _M.observe()
     end
     local rb = require "resty.retry_budget"
     local all = rb.stats()
-    for name, st in pairs(all) do
-        local label = { name }
-        gauges.requests:set(st.requests or 0, label)
-        gauges.retries:set(st.retries or 0, label)
-        gauges.rejected:set(st.rejected or 0, label)
-        gauges.hedges_sent:set(st.hedges_sent or 0, label)
-        gauges.hedges_won:set(st.hedges_won or 0, label)
-        gauges.dict_errors:set(st.dict_errors or 0, label)
-        local lat = st.latency_ms or {}
-        if lat.p50 then
-            gauges.latency:set(lat.p50, { name, "0.5" })
-        end
-        if lat.p95 then
-            gauges.latency:set(lat.p95, { name, "0.95" })
-        end
-        if lat.p99 then
-            gauges.latency:set(lat.p99, { name, "0.99" })
+    -- NaN clears a percentile whose samples have left the window.
+    -- A number that is only omitted would keep the previous scrape.
+    local missing = 0 / 0
+    for zone, names in pairs(all) do
+        for name, st in pairs(names) do
+            local label = { name, zone }
+            gauges.requests:set(st.requests or 0, label)
+            gauges.retries:set(st.retries or 0, label)
+            gauges.rejected:set(st.rejected or 0, label)
+            gauges.hedges_sent:set(st.hedges_sent or 0, label)
+            gauges.hedges_won:set(st.hedges_won or 0, label)
+            gauges.dict_errors:set(st.dict_errors or 0, label)
+            local lat = st.latency_ms or {}
+            gauges.latency:set(lat.p50 or missing, { name, zone, "0.5" })
+            gauges.latency:set(lat.p95 or missing, { name, zone, "0.95" })
+            gauges.latency:set(lat.p99 or missing, { name, zone, "0.99" })
         end
     end
     return true

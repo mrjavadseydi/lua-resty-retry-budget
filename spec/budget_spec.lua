@@ -201,9 +201,52 @@ describe("budget", function()
         new_budget("payments", env)
         new_budget("redis", env)
         local all = budget.stats_all()
-        assert.equal(0, all.payments.requests)
-        assert.equal(0, all.redis.requests)
-        assert.equal(0.2, all.payments.allowed_ratio)
+        assert.equal(0, all.retry_budget.payments.requests)
+        assert.equal(0, all.retry_budget.redis.requests)
+        assert.equal(0.2, all.retry_budget.payments.allowed_ratio)
+        assert.equal("retry_budget", all.retry_budget.payments.dict)
+    end)
+
+    it("keeps one entry per zone when the name is shared", function()
+        local env = box(10)
+        local other = box(10)
+        local a = new_budget("payments", env)
+        local b = budget.new("payments", {
+            dict = "other",
+            dict_obj = other.dict,
+            clock = clock_of(other),
+        })
+        assert.is_true(a:record_request())
+        assert.is_true(b:record_request())
+        assert.is_true(b:record_request())
+        local all = budget.stats_all()
+        assert.equal(1, all.retry_budget.payments.requests)
+        assert.equal(2, all.other.payments.requests)
+    end)
+
+    it("writes the name index after a busy lock is released", function()
+        local env = box(10)
+        _G.ngx.now = function()
+            return env.now
+        end
+        _G.ngx.ERR = 3
+        env.dict:set("rb:\0lock", "1", 30)
+        assert.is_truthy(new_budget("payments", env))
+        assert.is_true(budget.register_name(env.dict, "retry_budget", "payments"))
+        assert.is_nil(env.dict:get("rb:\0names"))
+        env.dict:delete("rb:\0lock")
+        assert.is_true(budget.register_name(env.dict, "retry_budget", "payments"))
+        local blob = env.dict:get("rb:\0names")
+        assert.is_truthy(blob and blob:find("payments", 1, true))
+
+        budget._reset()
+        _G.ngx.now = function()
+            return env.now
+        end
+        new_budget("other", env)
+        local all = budget.stats_all()
+        assert.equal(0, all.retry_budget.payments.requests)
+        assert.equal(0, all.retry_budget.other.requests)
     end)
 
     it("rejects a bad name or window", function()

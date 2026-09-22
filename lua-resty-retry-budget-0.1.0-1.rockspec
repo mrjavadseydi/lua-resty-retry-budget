@@ -1,7 +1,7 @@
 package = "lua-resty-retry-budget"
 version = "0.1.0-1"
 source = {
-    url = "git://example.com/lua-resty-retry-budget.git",
+    url = "git+https://github.com/mrjavadseydi/lua-resty-retry-budget.git",
     tag = "v0.1.0",
 }
 description = {
@@ -11,7 +11,7 @@ description = {
         hedged attempt to cut tail latency. Shared state lives in a
         lua_shared_dict so every nginx worker draws from the same budget.
     ]],
-    homepage = "https://example.com/lua-resty-retry-budget",
+    homepage = "https://github.com/mrjavadseydi/lua-resty-retry-budget",
     license = "BSD",
 }
 dependencies = {

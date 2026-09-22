@@ -105,9 +105,13 @@ full dict means retries are unlimited until the zone works again.
 ```lua
 budget:stats()
 -- requests, retries, allowed_ratio, allowance, rejected,
--- hedges_sent, hedges_won, dict_errors, latency_ms
-rb.stats()  -- every budget name in the zones this worker has opened
+-- hedges_sent, hedges_won, dict_errors, dict, latency_ms
+local all = rb.stats()
+-- all[dict_name][budget_name]
 ```
+
+The same budget name in two shared dicts stays two entries. `dict` on each
+stats table is the zone name.
 
 `allowed_ratio` is the configured ratio. The floor shows up as `allowance`
 (100 with the defaults and an empty window).
@@ -165,12 +169,20 @@ When the budget refuses another attempt, the return value is the last real
 response or error from the upstream. `meta.budget_exhausted` is true. No
 synthetic status is invented.
 
-`deadline_ms` is a wall clock for the whole call. Before each `connect`,
-`send`, and `receive`, the socket timeout is set to the lesser of the
-configured timeout and the time still left. Body reads use `receiveany` so a
-trickle of bytes cannot refresh an idle timer for the rest of the deadline.
-A retry sleep that would not finish before the deadline is not started, and
-the budget token for it is not taken.
+`deadline_ms` is a wall clock for the whole call, starting when
+`request_uri` is entered. A retry and a hedge share that clock. They do
+not each receive a new `deadline_ms`. Before each `connect`, `send`, and
+`receive`, the socket timeout is set to the lesser of the configured
+timeout and the time still left. Body reads use `receiveany` so a trickle
+of bytes cannot refresh an idle timer for the rest of the deadline. A
+retry sleep that would not finish before the deadline is not started, and
+the budget token for it is not taken. A hedge timer that wakes because
+the deadline was reached does not send another attempt, and
+`meta.deadline_exceeded` is set.
+
+Interim `1xx` responses (`100`, `102`, `103`) are read and discarded. The
+status and body returned are the final response. `101` is returned as-is
+and the connection is closed, because it is no longer an HTTP connection.
 
 ## Hedged requests
 
@@ -367,8 +379,11 @@ prometheus:collect()
 The series are window gauges (`retry_budget_requests_window`,
 `retry_budget_retries_window`, `retry_budget_retries_rejected_window`,
 `retry_budget_hedges_sent_window`, `retry_budget_hedges_won_window`,
-`retry_budget_dict_errors_window`, `retry_budget_latency_ms`). Read them
-directly. `rate()` is the wrong function for a window count.
+`retry_budget_dict_errors_window`, `retry_budget_latency_ms`). Each one is
+labeled `budget` and `dict`. Latency also has `quantile` (`0.5`, `0.95`,
+`0.99`). Read them directly. `rate()` is the wrong function for a window
+count. A percentile with no samples in the current window is set to NaN,
+so an expired histogram does not keep the previous scrape.
 
 ## Logs
 
@@ -387,6 +402,9 @@ make t       # local Test::Nginx, or a skip message if it is not installed
 make prove   # Test::Nginx inside openresty/openresty
 make bench   # wrk amplification and happy-path overhead, in Docker
 ```
+
+GitHub Actions runs the unit tests and `t/docker-prove.sh` on every push
+and pull request.
 
 ## Benchmark
 

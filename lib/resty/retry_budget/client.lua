@@ -412,8 +412,9 @@ local function read_chunked(clock, deadline_ms, start, sock, read_timeout)
 end
 
 local function read_body(clock, deadline_ms, start, sock, read_timeout, headers, method, status)
-    if method == "HEAD" or status == 204 or status == 304
-        or (status >= 100 and status < 200) then
+    -- 101 takes over the connection and has no HTTP body. Other 1xx
+    -- responses are interim and are consumed before this is called.
+    if method == "HEAD" or status == 204 or status == 304 or status == 101 then
         return "", nil, false
     end
     if is_chunked(headers) then
@@ -459,12 +460,12 @@ function _M.finish_socket(self, httpc, keep)
     if not httpc then
         return
     end
-    if not keep then
+    if not keep or httpc.keepalive == false then
         close_httpc(httpc)
         return
     end
     local ok, err = httpc:set_keepalive(self.keepalive_timeout, self.keepalive_pool)
-    if not ok and err ~= "closed" and err ~= "connection must be closed" then
+    if not ok and err ~= "closed" then
         close_httpc(httpc)
     end
 end
@@ -480,8 +481,11 @@ end
 
 -- One HTTP exchange. The body is read on this light thread so a later
 -- ngx.thread.kill finalizes the cosocket. Caller pools or closes `httpc`.
-function _M.attempt(self, uri, params, deadline_ms, slot)
+function _M.attempt(self, uri, params, deadline_ms, slot, request_start)
     local started = self.clock()
+    -- Socket timeouts share the request_uri clock. A retry must not
+    -- receive a fresh deadline_ms.
+    local origin = request_start or started
     local httpc, err = self.http.new()
     if not httpc then
         return nil, err or "no socket", nil, nil, nil, "connect_error"
@@ -501,7 +505,7 @@ function _M.attempt(self, uri, params, deadline_ms, slot)
     local query = params.query or parsed[5]
 
     local sock = httpc.sock
-    local ok, aerr, capped = arm(self.clock, deadline_ms, started, sock,
+    local ok, aerr, capped = arm(self.clock, deadline_ms, origin, sock,
                                  self.connect_timeout)
     if not ok then
         close_httpc(httpc)
@@ -525,7 +529,7 @@ function _M.attempt(self, uri, params, deadline_ms, slot)
         return nil, err, nil, elapsed, kind, class
     end
 
-    ok, aerr, capped = arm(self.clock, deadline_ms, started, sock, self.send_timeout)
+    ok, aerr, capped = arm(self.clock, deadline_ms, origin, sock, self.send_timeout)
     if not ok then
         close_httpc(httpc)
         return nil, aerr, nil, nil, nil, "deadline"
@@ -548,35 +552,52 @@ function _M.attempt(self, uri, params, deadline_ms, slot)
         return nil, err, nil, elapsed, kind, class
     end
 
-    local line, lerr, lcapped = recv_line(self.clock, deadline_ms, started, sock,
-                                           self.read_timeout)
-    if not line then
-        local class = class_of("read", lerr, lcapped)
-        local elapsed = (self.clock() - started) * 1000
-        local kind = (class == "read_timeout") and "timeout" or nil
-        close_httpc(httpc)
-        return nil, lerr, nil, elapsed, kind, class
-    end
-    local version = tonumber(line:sub(6, 8))
-    local status = tonumber(line:sub(10, 12))
-    if not version or not status then
-        close_httpc(httpc)
-        return nil, "bad status line", nil, nil, nil, "transport"
-    end
-    local reason = line:sub(14)
-
-    local headers, herr, hcapped = read_headers(self.clock, deadline_ms, started,
-        sock, self.read_timeout, self.http_headers)
-    if not headers then
-        local class = class_of("read", herr, hcapped)
-        local elapsed = (self.clock() - started) * 1000
-        local kind = (class == "read_timeout") and "timeout" or nil
-        close_httpc(httpc)
-        return nil, herr, nil, elapsed, kind, class
+    local version, status, reason, headers
+    local interim = 0
+    while true do
+        local line, lerr, lcapped = recv_line(self.clock, deadline_ms, origin,
+                                               sock, self.read_timeout)
+        if not line then
+            local class = class_of("read", lerr, lcapped)
+            local elapsed = (self.clock() - started) * 1000
+            local kind = (class == "read_timeout") and "timeout" or nil
+            close_httpc(httpc)
+            return nil, lerr, nil, elapsed, kind, class
+        end
+        version = tonumber(line:sub(6, 8))
+        status = tonumber(line:sub(10, 12))
+        if not version or not status then
+            close_httpc(httpc)
+            return nil, "bad status line", nil, nil, nil, "transport"
+        end
+        reason = line:sub(14)
+        local herr, hcapped
+        headers, herr, hcapped = read_headers(self.clock, deadline_ms, origin,
+            sock, self.read_timeout, self.http_headers)
+        if not headers then
+            local class = class_of("read", herr, hcapped)
+            local elapsed = (self.clock() - started) * 1000
+            local kind = (class == "read_timeout") and "timeout" or nil
+            close_httpc(httpc)
+            return nil, herr, nil, elapsed, kind, class
+        end
+        -- 100, 102, and 103 are followed by a final response on this
+        -- socket. 101 is final: the connection is no longer HTTP.
+        if status < 100 or status >= 200 or status == 101 then
+            break
+        end
+        interim = interim + 1
+        if interim > 16 then
+            close_httpc(httpc)
+            return nil, "too many interim responses", nil, nil, nil, "transport"
+        end
     end
     apply_keepalive(httpc, version, headers)
+    if status == 101 then
+        httpc.keepalive = false
+    end
 
-    local body, berr, bcapped = read_body(self.clock, deadline_ms, started, sock,
+    local body, berr, bcapped = read_body(self.clock, deadline_ms, origin, sock,
         self.read_timeout, headers, params.method, status)
     if not body then
         local class = class_of("read", berr, bcapped)
@@ -605,6 +626,10 @@ function _M.sequential(self, uri, params, meta, already, last_res, last_err,
     local attempt = already
     while attempt < max_attempts do
         if attempt >= 1 then
+            if class == "deadline" or meta.deadline_exceeded then
+                meta.deadline_exceeded = true
+                break
+            end
             if not self:should_retry(res, class) then
                 break
             end
@@ -632,7 +657,7 @@ function _M.sequential(self, uri, params, meta, already, last_res, last_err,
         meta.attempts = attempt
         local httpc, sample_ms, sample_kind
         res, err, httpc, sample_ms, sample_kind, class =
-            self:attempt(uri, params, deadline_ms, nil)
+            self:attempt(uri, params, deadline_ms, nil, start)
         meta.winner = attempt
         self:record_sample(sample_kind, sample_ms)
         if class == "ok" then

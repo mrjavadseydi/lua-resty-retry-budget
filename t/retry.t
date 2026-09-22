@@ -147,6 +147,29 @@ server {
             ngx.say("one")
         }
     }
+
+    location = /two-slow {
+        content_by_lua_block {
+            local n = ngx.shared.state:incr("twoslow", 1, 0)
+            ngx.sleep(0.35)
+            ngx.header["Connection"] = "close"
+            if n == 1 then
+                ngx.status = 503
+                ngx.say("no")
+                return
+            end
+            ngx.say("yes")
+        }
+    }
+
+    location = /hedge-dead {
+        content_by_lua_block {
+            ngx.shared.state:incr("hedgedead", 1, 0)
+            ngx.sleep(1)
+            ngx.header["Connection"] = "close"
+            ngx.say("slow")
+        }
+    }
 }
 EOF
     $block->set_value("http_config", $block->http_config . $extra);
@@ -566,3 +589,65 @@ false
 --- error_log
 key=full shared dict evicted
 --- timeout: 10
+
+
+
+=== TEST 11: the deadline covers the retry, not only the first attempt
+--- config
+    location = /t {
+        content_by_lua_block {
+            local c = require("resty.retry_budget").new_client("twoslow", {
+                dict = "retry_budget",
+                max_attempts = 2,
+                min_retries_per_sec = 100,
+                deadline_ms = 500,
+                connect_timeout = 2000,
+                read_timeout = 5000,
+                backoff = { base_ms = 1, max_ms = 1 },
+            })
+            local res, err, meta = c:request_uri("http://127.0.0.1:1985/two-slow")
+            ngx.say(meta.deadline_exceeded and "yes" or "no")
+            local status = res and res.status or 0
+            ngx.say(status == 200 and "full" or "cut")
+            ngx.say(meta.attempts)
+        }
+    }
+--- request
+GET /t
+--- response_body
+yes
+cut
+2
+--- timeout: 8
+
+
+
+=== TEST 12: a hedge timer that hits the deadline does not send
+--- config
+    location = /t {
+        content_by_lua_block {
+            local c = require("resty.retry_budget").new_client("hedgedead", {
+                dict = "retry_budget",
+                max_attempts = 2,
+                min_retries_per_sec = 100,
+                deadline_ms = 200,
+                connect_timeout = 1000,
+                read_timeout = 5000,
+            })
+            local res, _, meta = c:request_uri("http://127.0.0.1:1985/hedge-dead", nil, {
+                hedge = { enabled = true, delay = 500, max_hedges = 1 },
+            })
+            ngx.say(meta.deadline_exceeded and "yes" or "no")
+            ngx.say(meta.hedged and "yes" or "no")
+            ngx.say(ngx.shared.state:get("hedgedead") or 0)
+            ngx.say(res and res.status or "none")
+        }
+    }
+--- request
+GET /t
+--- response_body
+yes
+no
+1
+none
+--- timeout: 8

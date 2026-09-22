@@ -68,18 +68,31 @@ function _M.register_name(dict, zone, name)
 
     local marker = "rb:" .. name .. ":n"
     local ok, err = dict:add(marker, "1")
-    if not ok then
-        if err == "exists" then
-            return true
-        end
+    if not ok and err ~= "exists" then
         return nil, err
     end
 
-    local locked, lerr = dict:add(LOCK_KEY, "1", 1)
-    if not locked then
-        return true, lerr
+    -- The marker is written before the lock. Its presence does not mean
+    -- the index was updated; a busy lock leaves both behind for the next
+    -- registration to finish.
+    local cur, gerr = dict:get(NAMES_KEY)
+    if cur == nil and type(gerr) == "string" then
+        return nil, gerr
     end
-    local cur = dict:get(NAMES_KEY) or ""
+    if has_name(cur or "", name) then
+        return true
+    end
+
+    local locked = dict:add(LOCK_KEY, "1", 1)
+    if not locked then
+        return true
+    end
+    cur, gerr = dict:get(NAMES_KEY)
+    if cur == nil and type(gerr) == "string" then
+        dict:delete(LOCK_KEY)
+        return nil, gerr
+    end
+    cur = cur or ""
     if not has_name(cur, name) then
         local _, serr = dict:set(NAMES_KEY, cur .. name .. "\n")
         if serr then
@@ -472,6 +485,7 @@ function _M.stats(self)
         hedges_sent = hs,
         hedges_won = hw,
         dict_errors = dict_errors,
+        dict = self.zone,
         latency_ms = latency_for(self.zone, self.name, self.dict, self.clock),
     }
 end
@@ -532,19 +546,21 @@ function _M.stats_all()
                 names[name] = true
             end
         end
+        local bucket = {}
         local by_zone = objects[zone] or {}
         for name in pairs(names) do
             local obj = by_zone[name]
+            local st
             if obj then
-                out[name] = obj:stats()
+                st = obj:stats()
             else
-                local clock = default_clock
-                local st = stats_from_cfg(dict, zone, name, clock)
-                if st then
-                    out[name] = st
-                end
+                st = stats_from_cfg(dict, zone, name, default_clock)
+            end
+            if st then
+                bucket[name] = st
             end
         end
+        out[zone] = bucket
     end
     return out
 end

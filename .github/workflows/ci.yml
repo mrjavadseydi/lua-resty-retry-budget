@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: leafo/gh-actions-lua@v10
+        with:
+          luaVersion: luajit-2.1.0-beta3
+      - uses: leafo/gh-actions-luarocks@v4
+      - name: Install busted
+        run: luarocks install busted
+      - name: Unit tests and global-write check
+        run: |
+          make test
+          make gset LUAJIT=luajit
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test::Nginx
+        run: bash t/docker-prove.sh
