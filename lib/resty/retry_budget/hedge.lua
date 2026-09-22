@@ -131,13 +131,13 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
 
     local function arm_timer(ms)
         local remain = deadline.remaining_ms(deadline_ms, start, client.clock())
-        local sleep_ms = ms
+        local sleep_ms = ms > 0 and ms or 0
         local hit_deadline = false
         if remain and remain < sleep_ms then
             sleep_ms = remain
             hit_deadline = true
         end
-        if not sleep_ms or sleep_ms < 1 then
+        if hit_deadline and sleep_ms < 1 then
             meta.deadline_exceeded = true
             return
         end

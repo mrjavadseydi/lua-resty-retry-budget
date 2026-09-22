@@ -141,10 +141,10 @@ loop so those cases stay distinct.
 | `fail_mode` | `"open"` | `"open"` or `"closed"` |
 | `backoff.base_ms` | `25` | full jitter, `base * 2^(attempt-1)` |
 | `backoff.max_ms` | `1000` | cap, also the cap for `Retry-After` |
-| `retry_on.connect_error` | `true` | refused, reset, DNS, connect timeout |
+| `retry_on.connect_error` | `true` | refused, DNS, connect timeout, and a reset before the status line |
 | `retry_on.timeout` | `false` | send or read timeout |
 | `retry_on.status` | `502, 503, 504` | |
-| `idempotent_methods` | `GET`, `HEAD`, `OPTIONS` | |
+| `idempotent_methods` | `GET`, `HEAD`, `OPTIONS` | list `{ "GET" }` or set `{ GET = true }` |
 | `idempotency_header` | `Idempotency-Key` | any non-empty value makes the call retryable |
 | `respect_retry_after` | `true` | on 429 and 503, capped by `max_ms` and the deadline |
 | `connect_timeout` | `1000` | milliseconds |

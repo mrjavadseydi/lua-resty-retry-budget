@@ -53,9 +53,29 @@ describe("client policy", function()
         assert.is_nil(c:header({ ["Retry-After"] = "" }, "Retry-After"))
     end)
 
+    it("accepts idempotent_methods as a list or a set", function()
+        local list = client.new("list", {
+            dict = "retry_budget",
+            dict_obj = fake.new(function() return 10 end),
+            idempotent_methods = { "get", "PUT" },
+        })
+        assert.is_nil(list:skip_reason("GET", {}))
+        assert.is_nil(list:skip_reason("PUT", {}))
+        assert.equal("non_idempotent", list:skip_reason("POST", {}))
+        local set = client.new("set", {
+            dict = "retry_budget",
+            dict_obj = fake.new(function() return 10 end),
+            idempotent_methods = { PUT = true, GET = false },
+        })
+        assert.is_nil(set:skip_reason("PUT", {}))
+        assert.equal("non_idempotent", set:skip_reason("GET", {}))
+    end)
+
     it("retries connect failures and not read timeouts", function()
         assert.is_true(c:should_retry(nil, "connect_error"))
         assert.is_true(c:should_retry(nil, "connect_timeout"))
+        assert.is_true(c:should_retry(nil, "reset"))
+        assert.is_false(c:should_retry(nil, "transport"))
         assert.is_false(c:should_retry(nil, "read_timeout"))
         assert.is_false(c:should_retry(nil, "send_timeout"))
         assert.is_true(c:should_retry({ status = 503, headers = {} }, "ok"))

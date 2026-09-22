@@ -85,7 +85,7 @@ function _M.register_name(dict, zone, name)
 
     local locked = dict:add(LOCK_KEY, "1", 1)
     if not locked then
-        return true
+        return false, "busy"
     end
     cur, gerr = dict:get(NAMES_KEY)
     if cur == nil and type(gerr) == "string" then
@@ -356,7 +356,11 @@ function _M.new(name, opts)
 
     local rok, rerr = _M.register_name(dict, zone, name)
     if not rok then
-        note(self, "dict_op", "name registration failed: " .. (rerr or ""))
+        -- record_request retries until the name reaches the shared index.
+        self._unindexed = true
+        if rerr ~= "busy" then
+            note(self, "dict_op", "name registration failed: " .. (rerr or ""))
+        end
     end
 
     dict:set(self.cfg_key, window .. "," .. ratio .. "," .. min_r
@@ -366,6 +370,10 @@ function _M.new(name, opts)
 end
 
 function _M.record_request(self)
+    if self._unindexed
+        and _M.register_name(self.dict, self.zone, self.name) then
+        self._unindexed = nil
+    end
     local _, _, _, _, _, _, err = sums(self)
     if err then
         note(self, "dict_op", "shared dict read failed: " .. err)
@@ -413,6 +421,9 @@ function _M.try_acquire(self)
     if forcible then
         note(self, "dict_full", "shared dict evicted live entries")
         if self.fail_mode == "closed" then
+            -- Denied, so it counts as rejected, not as a sent retry.
+            self.dict:incr(self._cache.t_key, -1, 0, self.ttl)
+            self.dict:incr(self._cache.j_key, 1, 0, self.ttl)
             return false
         end
     end

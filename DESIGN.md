@@ -102,7 +102,7 @@ Name registration in `new()`:
 1. `add(P.."n", "1")`. The marker means registration has started. `"exists"` is not proof the index contains the name.
 2. If `rb:\0names` already lists the name, stop.
 3. `add("rb:\0lock", "1", 1)`. On success, re-read the index, append `name .. "\n"` if absent, then `delete` the lock.
-4. If the lock is busy, leave the marker and return. The next `register_name` of that name tries the index again. `stats()` unions the dict index with names constructed in this worker, so a lock miss does not hide a local budget, and a later registration publishes it to other workers.
+4. If the lock is busy, leave the marker and return `false, "busy"`. The budget object retries on each `record_request` until the index lists the name. `stats()` unions the dict index with names constructed in this worker, so a lock miss does not hide a local budget, and a later registration publishes it to other workers.
 
 ## Budget algorithm
 
@@ -163,7 +163,7 @@ Hedge counters (`hs`, `hw`) are the same shape: `record_hedge_sent`, `record_hed
 | Event | `fail_mode = "open"` (default) | `fail_mode = "closed"` |
 | --- | --- | --- |
 | `incr` / `get` path returns an error (`"no memory"`, `"not a number"`, zone missing at call time) | allow the retry, do not claim it was counted | deny the retry |
-| `forcible == true` | allow; the incr already counted | deny; the incr already counted, so later retries are tighter |
+| `forcible == true` | allow; the incr already counted | deny; undo the `t` incr and count it in `j` |
 | `record_request` fails | log, continue with the user request | same; the first attempt is not gated |
 
 Every such event: best-effort `incr` of the `e` bucket, and one warning per distinct code per key per second. The limiter is `add(P.."log:"..code, "1", 1)`. If that `add` fails because the key exists, skip the log. If it fails because the dict is unusable, a worker-local timestamp suppresses repeats for 1s. Log line shape:
@@ -303,11 +303,11 @@ without indexing a cosocket. `ngx.get_phase()` is the check.
 Retryable iff all of:
 
 - `type(body) ~= "function"` (a table or string body is replayable; a function is a stream);
-- method is in `idempotent_methods` (default `GET`, `HEAD`, `OPTIONS`) **or** `headers[idempotency_header]` is a non-empty string. Header lookup is case-insensitive. An empty string does not count.
+- method is in `idempotent_methods` (default `GET`, `HEAD`, `OPTIONS`; a list `{ "GET" }` or a set `{ GET = true }`) **or** `headers[idempotency_header]` is a non-empty string. Header lookup is case-insensitive. An empty string does not count.
 
 Otherwise one attempt, `meta.retry_skipped = "streaming_body"` or `"non_idempotent"`. Hedges use the same predicate.
 
-A **response** is retried when `retry_on.status[status]` is true, or the 429 rule above matches. A **transport error** is retried when it was classified `connect_error` and `retry_on.connect_error` (default true), or classified `timeout` and `retry_on.timeout` (default **false**).
+A **response** is retried when `retry_on.status[status]` is true, or the 429 rule above matches. A **transport error** is retried when it was classified `connect_error` and `retry_on.connect_error` (default true), or classified `timeout` and `retry_on.timeout` (default **false**). A non-timeout error on send or before the status line (typically a pooled keepalive connection the upstream already closed) is classified `reset` and follows `retry_on.connect_error`. Errors after the status line are `transport` and never retried.
 
 Default `retry_on.status`: 502, 503, 504. Built into a lookup table in `new()`.
 

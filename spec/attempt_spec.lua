@@ -187,6 +187,35 @@ describe("client attempts", function()
         assert.is_true(second > 200 and second < 400)
     end)
 
+    it("keeps repeated headers and retries a closed pooled connection", function()
+        scripted_http({
+            { lines = {}, chunks = {} },
+            {
+                lines = {
+                    "HTTP/1.1 200 OK",
+                    "Set-Cookie: a=1",
+                    "Set-Cookie: b=2",
+                    "Content-Length: 2",
+                    "",
+                },
+                chunks = { "ok" },
+            },
+        })
+        local c = client.new("reset", {
+            dict = "retry_budget",
+            dict_obj = fake.new(clock_of(box)),
+            clock = clock_of(box),
+            random = function()
+                return 0
+            end,
+            idempotent_methods = { "GET" },
+        })
+        local res, err, meta = c:request_uri("http://127.0.0.1/")
+        assert.is_nil(err)
+        assert.equal(2, meta.attempts)
+        assert.same({ "a=1", "b=2" }, res.headers["Set-Cookie"])
+    end)
+
     it("reads the final response that follows 100 and 103", function()
         local consumed
         scripted_http({

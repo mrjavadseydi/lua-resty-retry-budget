@@ -78,8 +78,11 @@ end
 local function idempotent_set(src)
     local set = {}
     local from = src or { GET = true, HEAD = true, OPTIONS = true }
+    -- Accepts a list { "GET", "PUT" } or a set { GET = true }.
     for k, v in pairs(from) do
-        if v then
+        if type(k) == "number" then
+            set[tostring(v):upper()] = true
+        elseif v then
             set[tostring(k):upper()] = true
         end
     end
@@ -185,7 +188,8 @@ function _M.skip_reason(self, method, params)
 end
 
 function _M.should_retry(self, res, class)
-    if class == "connect_error" or class == "connect_timeout" then
+    if class == "connect_error" or class == "connect_timeout"
+        or class == "reset" then
         return self.connect_error
     end
     if class == "send_timeout" or class == "read_timeout" then
@@ -260,6 +264,11 @@ local function class_of(stage, err, capped)
     end
     if stage == "connect" then
         return "connect_error"
+    end
+    -- A reused keepalive connection the upstream already closed fails on
+    -- send or before the status line. Only idempotent requests retry.
+    if stage == "send" or stage == "status" then
+        return "reset"
     end
     return "transport"
 end
@@ -361,7 +370,14 @@ local function read_headers(clock, deadline_ms, start, sock, read_timeout, http_
         end
         local key, val = line:match("^([^:%s]+):%s*(.*)$")
         if key then
-            headers[key] = val
+            local prev = headers[key]
+            if prev == nil then
+                headers[key] = val
+            elseif type(prev) == "table" then
+                prev[#prev + 1] = val
+            else
+                headers[key] = { prev, val }
+            end
         end
     end
 end
@@ -420,7 +436,16 @@ local function read_body(clock, deadline_ms, start, sock, read_timeout, headers,
     if is_chunked(headers) then
         return read_chunked(clock, deadline_ms, start, sock, read_timeout)
     end
-    local len = tonumber(headers["Content-Length"] or "")
+    local cl = headers["Content-Length"]
+    if type(cl) == "table" then
+        for i = 2, #cl do
+            if cl[i] ~= cl[1] then
+                return nil, "conflicting content-length", false
+            end
+        end
+        cl = cl[1]
+    end
+    local len = tonumber(cl or "")
     if not len then
         local chunks = {}
         local n = 0
@@ -558,7 +583,8 @@ function _M.attempt(self, uri, params, deadline_ms, slot, request_start)
         local line, lerr, lcapped = recv_line(self.clock, deadline_ms, origin,
                                                sock, self.read_timeout)
         if not line then
-            local class = class_of("read", lerr, lcapped)
+            local class = class_of(interim == 0 and "status" or "read", lerr,
+                                   lcapped)
             local elapsed = (self.clock() - started) * 1000
             local kind = (class == "read_timeout") and "timeout" or nil
             close_httpc(httpc)
