@@ -175,6 +175,8 @@ not each receive a new `deadline_ms`. Before each `connect`, `send`, and
 `receive`, the socket timeout is set to the lesser of the configured
 timeout and the time still left. Body reads use `receiveany` so a trickle
 of bytes cannot refresh an idle timer for the rest of the deadline. A
+separate deadline timer cancels pending attempts, including a slow header
+read or a yielding request-body producer. Cancelled sockets are closed. A
 retry sleep that would not finish before the deadline is not started, and
 the budget token for it is not taken. A hedge timer that wakes because
 the deadline was reached does not send another attempt, and
@@ -183,6 +185,8 @@ the deadline was reached does not send another attempt, and
 Interim `1xx` responses (`100`, `102`, `103`) are read and discarded. The
 status and body returned are the final response. `101` is returned as-is
 and the connection is closed, because it is no longer an HTTP connection.
+With `Expect: 100-continue`, the body is sent once after the first `100`,
+using the remaining deadline. A final rejection leaves the body unsent.
 
 ## Hedged requests
 

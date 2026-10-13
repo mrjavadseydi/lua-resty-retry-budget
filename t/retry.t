@@ -101,6 +101,55 @@ server {
         }
     }
 
+    location = /slow-headers {
+        content_by_lua_block {
+            local sock = assert(ngx.req.socket(true))
+            sock:send("HTTP/1.1 200 OK\\r\\nConnection: close\\r\\nContent-Length: 0\\r\\n")
+            ngx.sleep(0.35)
+            sock:send("\\r")
+            ngx.sleep(0.35)
+            sock:send("\\n")
+            return ngx.exit(444)
+        }
+    }
+
+    location = /hedge-headers {
+        content_by_lua_block {
+            local n = ngx.shared.state:incr("hedge_headers", 1, 0)
+            if n == 1 then
+                ngx.sleep(0.1)
+                ngx.status = 503
+                ngx.header["Connection"] = "close"
+                ngx.say("no")
+                return
+            end
+            local sock = assert(ngx.req.socket(true))
+            sock:send("HTTP/1.1 200 OK\\r\\nConnection: close\\r\\nContent-Length: 0\\r\\n")
+            ngx.sleep(0.35)
+            sock:send("\\r")
+            ngx.sleep(0.35)
+            sock:send("\\n")
+            return ngx.exit(444)
+        }
+    }
+
+    location = /continue {
+        content_by_lua_block {
+            ngx.req.read_body()
+            ngx.header["Connection"] = "close"
+            ngx.say(ngx.req.get_body_data() or "empty")
+        }
+    }
+
+    location = /continue-reject {
+        content_by_lua_block {
+            ngx.req.clear_header("Expect")
+            ngx.status = 417
+            ngx.header["Connection"] = "close"
+            ngx.say("rejected")
+        }
+    }
+
     location = /trickle {
         content_by_lua_block {
             ngx.status = 200
@@ -650,4 +699,194 @@ yes
 no
 1
 none
+--- timeout: 8
+
+
+=== TEST 13: the deadline cancels a trickled header with and without hedging
+--- config
+    location = /t {
+        content_by_lua_block {
+            local rb = require "resty.retry_budget"
+            for i = 1, 2 do
+                local c = assert(rb.new_client("header" .. i, {
+                    dict = "retry_budget", max_attempts = 2,
+                    deadline_ms = 500, read_timeout = 2000,
+                }))
+                local call_opts = i == 2 and {
+                    hedge = { enabled = true, delay = 1000 },
+                } or nil
+                local started = ngx.now()
+                local res, _, meta = c:request_uri("http://127.0.0.1:1985/slow-headers",
+                                                  nil, call_opts)
+                ngx.say(res == nil and "cancelled" or "late success")
+                ngx.say(meta.deadline_exceeded and "yes" or "no")
+                ngx.say(ngx.now() - started < 0.65 and "short" or "long")
+                ngx.say(meta.attempts)
+                ngx.say(meta.hedged and "yes" or "no")
+            end
+        }
+    }
+--- request
+GET /t
+--- response_body
+cancelled
+yes
+short
+1
+no
+cancelled
+yes
+short
+1
+no
+--- timeout: 8
+
+
+=== TEST 14: the deadline stops a yielding upload producer
+--- config
+    location = /t {
+        content_by_lua_block {
+            local c = assert(require("resty.retry_budget").new_client("upload", {
+                dict = "retry_budget", deadline_ms = 500,
+            }))
+            local produced = 0
+            local started = ngx.now()
+            local res, _, meta = c:request_uri("http://127.0.0.1:1985/continue", {
+                method = "POST", headers = { ["Content-Length"] = "3" },
+                body = function()
+                    if produced == 3 then return nil end
+                    ngx.sleep(0.35)
+                    produced = produced + 1
+                    return "x"
+                end,
+            })
+            ngx.say(res == nil and "cancelled" or "late success")
+            ngx.say(meta.deadline_exceeded and "yes" or "no")
+            ngx.say(ngx.now() - started < 0.65 and "short" or "long")
+            ngx.sleep(0.7)
+            ngx.say(produced)
+            ngx.say(meta.attempts)
+            ngx.say(meta.retry_skipped)
+        }
+    }
+--- request
+GET /t
+--- response_body
+cancelled
+yes
+short
+1
+1
+streaming_body
+--- timeout: 8
+
+
+=== TEST 15: 100 Continue sends string, table, and stream bodies
+--- config
+    location = /t {
+        content_by_lua_block {
+            local c = assert(require("resty.retry_budget").new_client("continue", {
+                dict = "retry_budget", deadline_ms = 1000,
+            }))
+            local sent = false
+            local bodies = { "hello", { "he", "llo" }, function()
+                if sent then return nil end
+                sent = true
+                return "hello"
+            end }
+            for i = 1, #bodies do
+                local res, err, meta = c:request_uri("http://127.0.0.1:1985/continue", {
+                    method = "POST", body = bodies[i],
+                    headers = { ["expect"] = "100-continue", ["Content-Length"] = "5" },
+                })
+                ngx.say(res and res.status or err)
+                ngx.say(res and res.body:gsub("%s+$", "") or "empty")
+                ngx.say(meta.attempts)
+            end
+        }
+    }
+--- request
+GET /t
+--- response_body
+200
+hello
+1
+200
+hello
+1
+200
+hello
+1
+--- timeout: 8
+
+
+=== TEST 16: an early final response does not consume the deferred body
+--- config
+    location = /t {
+        content_by_lua_block {
+            local c = assert(require("resty.retry_budget").new_client("reject", {
+                dict = "retry_budget", deadline_ms = 1000,
+            }))
+            local consumed = false
+            local res, err, meta = c:request_uri("http://127.0.0.1:1985/continue-reject", {
+                method = "POST", headers = { Expect = "100-continue", ["Content-Length"] = "5" },
+                body = function()
+                    if consumed then return nil end
+                    consumed = true
+                    return "hello"
+                end,
+            })
+            ngx.say(res and res.status or err)
+            ngx.say(consumed and "sent" or "deferred")
+            ngx.say(meta.attempts)
+        }
+    }
+--- request
+GET /t
+--- response_body
+417
+deferred
+1
+--- timeout: 8
+
+
+=== TEST 17: the deadline cancels sent hedges and preserves an earlier response
+--- config
+    location = /t {
+        content_by_lua_block {
+            local rb = require "resty.retry_budget"
+            local paths = { "/slow-headers", "/hedge-headers" }
+            for i = 1, #paths do
+                local c = assert(rb.new_client("senthedge" .. i, {
+                    dict = "retry_budget", max_attempts = 2,
+                    deadline_ms = 500, read_timeout = 2000,
+                }))
+                local started = ngx.now()
+                local res, _, meta = c:request_uri("http://127.0.0.1:1985" .. paths[i], nil, {
+                    hedge = { enabled = true, delay = 40 },
+                })
+                ngx.say(res and res.status or "cancelled")
+                ngx.say(meta.deadline_exceeded and "yes" or "no")
+                ngx.say(ngx.now() - started < 0.65 and "short" or "long")
+                ngx.say(meta.attempts)
+                ngx.say(meta.hedged and "yes" or "no")
+                ngx.say(c.budget:stats().hedges_won)
+            end
+        }
+    }
+--- request
+GET /t
+--- response_body
+cancelled
+yes
+short
+2
+yes
+0
+503
+yes
+short
+2
+yes
+0
 --- timeout: 8

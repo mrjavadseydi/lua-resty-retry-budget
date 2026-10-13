@@ -276,6 +276,8 @@ remaining_ms = deadline_ms - (clock() - start) * 1000
 
 The hedge timer sleeps `min(delay, remaining)`. If that sleep ends because the deadline was reached, it does not `try_acquire` and does not spawn another attempt. `meta.deadline_exceeded` is set. A deadline failure on a hedged attempt sets the same flag, including when the call then falls through to the sequential loop.
 
+A separate deadline timer cancels pending attempts at the absolute deadline. Sequential attempts run on a light thread so the caller can kill a blocked socket operation or yielding body producer. The hedge loop keeps its deadline timer alive independently of the hedge-delay timer and cancels all remaining attempts on expiry. Cancellation kills each attempt before closing its socket; cancelled sockets are never pooled.
+
 `settimeouts(connect, send, read)` does not enforce the deadline. Each value is an idle timeout for that operation, and the read timer is re-armed on every `receive`. An upstream that writes one byte every 900 ms keeps the attempt alive past any sum of the three configured timeouts. The client calls `sock:settimeout(ms)` immediately before `connect`, before `send`, and before every `receive` (status line, each header line, each body read). `ms = min(configured_for_that_op, remaining_ms)`. `sock:settimeout` writes that one value into the connect, send, and read slots; calling it immediately before the operation makes the next op use the wall-clock remainder. If `remaining_ms < 1`, the attempt stops, the socket is closed, and `meta.deadline_exceeded` is set. `settimeout(0)` is not used. The pure helper is `next_timeout_ms(remaining, configured) -> ms or nil`.
 
 ## HTTP client
@@ -330,6 +332,8 @@ On budget denial: return the last real `res, err` from `lua-resty-http`'s conven
 Sequential loop: `record_request` once; attempt 1 does not withdraw; attempts `2..max` withdraw after the delay fits and before the sleep. Each socket operation uses `next_timeout_ms`, not one `set_timeouts` for the whole attempt.
 
 Each attempt creates its own `httpc`. The parent `set_keepalive`s only after a full read. Errors `close`.
+
+For `Expect: 100-continue`, `send_request` sends only the headers. The attempt sends the deferred body once after the first `100`, then resumes reading interim and final responses. A final rejection before `100` leaves the body unsent. Deferred body writes share the request deadline and retain send-timeout classification.
 
 ## Hedge state machine
 

@@ -58,6 +58,7 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
     local spawned = 0
     local hedges = 0
     local timer
+    local deadline_timer
     local fallback
 
     local function spawn_attempt(is_hedge)
@@ -129,6 +130,14 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
         timer = nil
     end
 
+    local function stop_timers()
+        kill_timer()
+        if deadline_timer then
+            ngx.thread.kill(deadline_timer)
+            deadline_timer = nil
+        end
+    end
+
     local function arm_timer(ms)
         local remain = deadline.remaining_ms(deadline_ms, start, client.clock())
         local sleep_ms = ms > 0 and ms or 0
@@ -161,6 +170,18 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
         return n
     end
 
+    local remain = deadline.remaining_ms(deadline_ms, start, client.clock())
+    if remain then
+        if remain < 1 then
+            meta.deadline_exceeded = true
+            return nil, "deadline", meta
+        end
+        deadline_timer = ngx.thread.spawn(function()
+            ngx.sleep(remain / 1000)
+            return { id = -1 }
+        end)
+    end
+
     spawn_attempt(false)
     arm_timer(delay_ms)
 
@@ -175,6 +196,10 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
             n = n + 1
             list[n] = timer
         end
+        if deadline_timer then
+            n = n + 1
+            list[n] = deadline_timer
+        end
         if n == 0 then
             break
         end
@@ -188,7 +213,7 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
             for _, slot in pairs(slots) do
                 cancel(slot, true)
             end
-            kill_timer()
+            stop_timers()
             meta.hedge_skipped = "wait"
             return nil, "wait failed: " .. type(first) .. " " .. tostring(first), meta
         end
@@ -197,14 +222,25 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
         local httpc, sample_ms = pkt.httpc, pkt.sample_ms
         local sample_kind, class = pkt.sample_kind, pkt.class
 
+        remain = deadline.remaining_ms(deadline_ms, start, client.clock())
+        if who == -1 or pkt.deadline or (remain and remain < 1) then
+            for _, slot in pairs(slots) do
+                cancel(slot, false)
+            end
+            stop_timers()
+            meta.deadline_exceeded = true
+            meta.attempts = spawned
+            if fallback then
+                meta.winner = fallback.id
+                return fallback.res, fallback.err, meta
+            end
+            return nil, "deadline", meta
+        end
+
         if who == 0 then
             timer = nil
-            local remain = deadline.remaining_ms(deadline_ms, start, client.clock())
-            local at_deadline = pkt.deadline or (remain and remain < 1)
             local primary = slots[1]
-            if at_deadline then
-                meta.deadline_exceeded = true
-            elseif primary and not primary.reaped
+            if primary and not primary.reaped
                 and spawned < client.max_attempts and hedges < max_hedges then
                 if client.budget:try_acquire() then
                     hedges = hedges + 1
@@ -235,7 +271,7 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
                         cancel(other, true)
                     end
                 end
-                kill_timer()
+                stop_timers()
                 client:finish_socket(httpc, true)
                 if slot.is_hedge then
                     client.budget:record_hedge_won()
@@ -268,6 +304,7 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
         end
     end
 
+    stop_timers()
     meta.attempts = spawned
     local last_res, last_err, last_class, winner
     if fallback then

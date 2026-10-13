@@ -31,6 +31,7 @@ local function scripted_http(exchanges, on_keepalive)
     local keepalive = 0
     local closed = 0
     local attempt_n = 0
+    local sent = {}
     package.loaded["resty.http_headers"] = {
         new = function()
             return {}
@@ -48,6 +49,13 @@ local function scripted_http(exchanges, on_keepalive)
             end
             function sock:settimeout(ms)
                 timeouts[#timeouts + 1] = ms
+            end
+            function sock:send(data)
+                if ex.send_error then
+                    return nil, ex.send_error
+                end
+                sent[#sent + 1] = data
+                return type(data) == "table" and #table.concat(data) or #data
             end
             function sock:receive(pat)
                 if pat == "*l" then
@@ -108,6 +116,7 @@ local function scripted_http(exchanges, on_keepalive)
     }
     return {
         connect_timeouts = connect_timeouts,
+        sent = sent,
         keepalive = function()
             return keepalive
         end,
@@ -132,6 +141,15 @@ describe("client attempts", function()
                 return "content"
             end,
             sleep = function() end,
+            thread = {
+                spawn = function(fn)
+                    return { result = fn() }
+                end,
+                wait = function(thread)
+                    return true, thread.result
+                end,
+                kill = function() end,
+            },
             now = function()
                 return box.now
             end,
@@ -220,6 +238,89 @@ describe("client attempts", function()
         assert.is_nil(err)
         assert.equal(2, meta.attempts)
         assert.same({ "a=1", "b=2" }, res.headers["Set-Cookie"])
+    end)
+
+    it("closes a response that completes after the deadline instead of pooling it", function()
+        local script = scripted_http({
+            {
+                lines = { "HTTP/1.1 200 OK", "Content-Length: 2", "" },
+                chunks = { "ok" },
+                on_body = function() box.now = box.now + 0.6 end,
+            },
+        })
+        local c = client.new("late", {
+            dict_obj = fake.new(clock_of(box)), clock = clock_of(box),
+            deadline_ms = 500,
+        })
+        local res, err, meta = c:request_uri("http://127.0.0.1/")
+        assert.is_nil(res)
+        assert.equal("deadline", err)
+        assert.is_true(meta.deadline_exceeded)
+        assert.equal(1, meta.attempts)
+        assert.equal(0, script.keepalive())
+        assert.is_true(script.closed() >= 1)
+        assert.equal(0, c.budget:stats().retries)
+    end)
+
+    it("sends a deferred body once after 100, including after early hints", function()
+        local script = scripted_http({
+            {
+                lines = {
+                    "HTTP/1.1 103 Early Hints", "",
+                    "HTTP/1.1 100 Continue", "",
+                    "HTTP/1.1 100 Continue", "",
+                    "HTTP/1.1 200 OK", "Content-Length: 2", "",
+                },
+                chunks = { "ok" },
+            },
+        })
+        local c = client.new("continue", {
+            dict_obj = fake.new(clock_of(box)), clock = clock_of(box),
+        })
+        local body = { "he", "llo" }
+        local res, err = c:request_uri("http://127.0.0.1/", {
+            method = "POST", body = body,
+            headers = { ["expect"] = "100-continue" },
+        })
+        assert.is_nil(err)
+        assert.equal(200, res.status)
+        assert.same({ body }, script.sent)
+    end)
+
+    it("does not consume a deferred stream when the upstream rejects it", function()
+        local script = scripted_http({
+            {
+                lines = { "HTTP/1.1 417 Expectation Failed", "Content-Length: 0", "" },
+                chunks = {},
+            },
+        })
+        local c = client.new("rejected", {
+            dict_obj = fake.new(clock_of(box)), clock = clock_of(box),
+        })
+        local consumed = false
+        local res, err = c:request_uri("http://127.0.0.1/", {
+            method = "POST", headers = { Expect = "100-continue" },
+            body = function() consumed = true; return nil end,
+        })
+        assert.is_nil(err)
+        assert.equal(417, res.status)
+        assert.is_false(consumed)
+        assert.same({}, script.sent)
+    end)
+
+    it("does not retry a timeout while sending a deferred body", function()
+        scripted_http({
+            { lines = { "HTTP/1.1 100 Continue", "" }, send_error = "timeout" },
+        })
+        local c = client.new("continue_timeout", {
+            dict_obj = fake.new(clock_of(box)), clock = clock_of(box),
+        })
+        local res, err, meta = c:request_uri("http://127.0.0.1/", {
+            body = "hello", headers = { Expect = "100-continue" },
+        })
+        assert.is_nil(res)
+        assert.equal("timeout", err)
+        assert.equal(1, meta.attempts)
     end)
 
     it("does not retry a fresh connection closed before the status line", function()

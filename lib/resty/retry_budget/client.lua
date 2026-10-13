@@ -482,6 +482,36 @@ local function close_httpc(httpc)
     httpc:close()
 end
 
+local function send_body(self, sock, body, deadline_ms, start)
+    local streaming = type(body) == "function"
+    while true do
+        local chunk, err
+        if streaming then
+            chunk, err = body()
+        else
+            chunk = body
+        end
+        if chunk == nil then
+            if err then
+                return nil, err, false
+            end
+            return true
+        end
+        local ok, aerr, capped = arm(self.clock, deadline_ms, start, sock,
+                                     self.send_timeout)
+        if not ok then
+            return nil, aerr, capped
+        end
+        ok, err = sock:send(chunk)
+        if not ok then
+            return nil, err, capped
+        end
+        if not streaming then
+            return true
+        end
+    end
+end
+
 function _M.finish_socket(self, httpc, keep)
     if not httpc then
         return
@@ -578,6 +608,7 @@ function _M.attempt(self, uri, params, deadline_ms, slot, request_start)
         close_httpc(httpc)
         return nil, err, nil, elapsed, kind, class
     end
+    local body_pending = _M.header(req.headers, "Expect") == "100-continue"
 
     local version, status, reason, headers
     local interim = 0
@@ -608,6 +639,17 @@ function _M.attempt(self, uri, params, deadline_ms, slot, request_start)
             local kind = (class == "read_timeout") and "timeout" or nil
             close_httpc(httpc)
             return nil, herr, nil, elapsed, kind, class
+        end
+        if status == 100 and body_pending then
+            body_pending = false
+            ok, err, capped = send_body(self, sock, req.body, deadline_ms, origin)
+            if not ok then
+                local class = class_of("send", err, capped)
+                local elapsed = (self.clock() - started) * 1000
+                local kind = (class == "send_timeout") and "timeout" or nil
+                close_httpc(httpc)
+                return nil, err, nil, elapsed, kind, class
+            end
         end
         -- 100, 102, and 103 are followed by a final response on this
         -- socket. 101 is final: the connection is no longer HTTP.
@@ -642,6 +684,42 @@ function _M.attempt(self, uri, params, deadline_ms, slot, request_start)
         headers = headers,
         body = body,
     }, nil, httpc, elapsed, "response", "ok"
+end
+
+local function attempt_with_deadline(self, uri, params, deadline_ms, start)
+    if deadline_ms == nil then
+        return self:attempt(uri, params, nil, nil, start)
+    end
+
+    local slot = {}
+    local attempt = ngx.thread.spawn(function()
+        return { self:attempt(uri, params, deadline_ms, slot, start) }
+    end)
+    local remain = deadline.remaining_ms(deadline_ms, start, self.clock())
+    local timer
+    if remain >= 1 then
+        timer = ngx.thread.spawn(function()
+            ngx.sleep(remain / 1000)
+            return true
+        end)
+    end
+    local ok, result
+    if timer then
+        ok, result = ngx.thread.wait(attempt, timer)
+        ngx.thread.kill(timer)
+        remain = deadline.remaining_ms(deadline_ms, start, self.clock())
+    end
+    if not timer or result == true or remain < 1 then
+        -- Kill the reader before close(), which otherwise reports busy.
+        ngx.thread.kill(attempt)
+        close_httpc(slot.httpc)
+        return nil, "deadline", nil, nil, nil, "deadline"
+    end
+    if not ok then
+        close_httpc(slot.httpc)
+        return nil, result, nil, nil, nil, "error"
+    end
+    return unpack(result, 1, 6)
 end
 
 function _M.sequential(self, uri, params, meta, already, last_res, last_err,
@@ -685,7 +763,7 @@ function _M.sequential(self, uri, params, meta, already, last_res, last_err,
         meta.attempts = attempt
         local httpc, sample_ms, sample_kind
         res, err, httpc, sample_ms, sample_kind, class =
-            self:attempt(uri, params, deadline_ms, nil, start)
+            attempt_with_deadline(self, uri, params, deadline_ms, start)
         meta.winner = attempt
         self:record_sample(sample_kind, sample_ms)
         if class == "ok" then
