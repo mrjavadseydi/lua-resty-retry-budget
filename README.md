@@ -188,6 +188,12 @@ and the connection is closed, because it is no longer an HTTP connection.
 With `Expect: 100-continue`, the body is sent once after the first `100`,
 using the remaining deadline. A final rejection leaves the body unsent.
 
+Invalid or conflicting `Content-Length` values are rejected, including
+negative, hexadecimal, and fractional lengths. Equal repeated lengths are
+accepted. A response containing both `Transfer-Encoding` and `Content-Length`
+is rejected. Chunked bodies require valid sizes, data delimiters, and a
+complete trailer terminator; framing errors close the socket.
+
 ## Hedged requests
 
 ```lua
@@ -237,6 +243,7 @@ does not return a value below 1 ms. That does not move a hedge delay whose
 | Attempt 1 killed because a hedge won | yes, at the elapsed time (at least the hedge delay) |
 | Hedge attempt killed because attempt 1 won | no |
 | Connect, send, or read timeout | yes |
+| Deadline expiry after an attempt starts I/O | yes, each pending attempt at its elapsed time |
 | Fast connect error (refused, reset, DNS) | no |
 
 Killed attempt 1 is the request that was still running at the delay, so it
@@ -245,6 +252,8 @@ shrinks, and more requests hedge. The sample is censored, so the reported
 p95 is a lower bound, and it stays stable. Timeouts are recorded for the same
 reason: if more than 5% of attempts time out, p95 really is the timeout, and
 the hedge delay grows instead of adding load to a dying upstream.
+Deadline expiry is recorded even when it cancels a socket operation before
+the configured timeout. Calls that expire before starting I/O add no sample.
 
 ## Balancer recipe
 

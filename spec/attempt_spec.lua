@@ -62,14 +62,15 @@ local function scripted_http(exchanges, on_keepalive)
                     local line = ex.lines[li]
                     li = li + 1
                     if line == nil then
-                        return nil, "closed"
+                        if ex.on_line_error then ex.on_line_error() end
+                        return nil, ex.line_error or "closed"
                     end
                     return line
                 end
                 local data = ex.chunks[ci]
                 ci = ci + 1
                 if not data then
-                    return nil, "closed"
+                    return nil, ex.body_error or "closed"
                 end
                 return data
             end
@@ -80,7 +81,7 @@ local function scripted_http(exchanges, on_keepalive)
                     ex.on_body()
                 end
                 if not data then
-                    return nil, "closed"
+                    return nil, ex.body_error or "closed"
                 end
                 return data
             end
@@ -93,9 +94,13 @@ local function scripted_http(exchanges, on_keepalive)
             end
             function httpc:connect()
                 connect_timeouts[#connect_timeouts + 1] = timeouts[#timeouts]
+                if ex.on_connect then ex.on_connect() end
+                if ex.connect_error then return nil, ex.connect_error end
                 return true
             end
             function httpc:send_request()
+                if ex.on_request then ex.on_request() end
+                if ex.request_error then return nil, ex.request_error end
                 return true
             end
             function httpc:set_keepalive()
@@ -376,6 +381,181 @@ describe("client attempts", function()
         local res, err = c:request_uri("http://127.0.0.1/")
         assert.is_nil(err)
         assert.equal("ok", res.body)
+    end)
+
+    it("rejects invalid and conflicting lengths without retrying or pooling", function()
+        local cases = {
+            { "-1" }, { "+2" }, { "0x2" }, { "2.0" }, { "2e0" },
+            { "" }, { "bad" }, { "2, bad" }, { "2," }, { "2", "3" },
+            { "bad", "wrong" }, { "9007199254740992", "9007199254740993" },
+            { "\v2" },
+        }
+        for i, lengths in ipairs(cases) do
+            local lines = { "HTTP/1.1 200 OK" }
+            for _, value in ipairs(lengths) do
+                lines[#lines + 1] = "Content-Length: " .. value
+            end
+            lines[#lines + 1] = ""
+            local script = scripted_http({ { lines = lines, chunks = { "ok" }, reused = 1 } })
+            local c = client.new("invalid_length" .. i, {
+                dict_obj = fake.new(clock_of(box)), clock = clock_of(box),
+            })
+            local res, err, meta = c:request_uri("http://127.0.0.1/")
+            assert.is_nil(res)
+            assert.is_truthy(err:find("content-length", 1, true))
+            assert.equal(1, meta.attempts)
+            assert.equal(0, script.keepalive())
+            assert.is_true(script.closed() >= 1)
+        end
+    end)
+
+    it("accepts equal comma-separated lengths and leading zeros", function()
+        scripted_http({ {
+            lines = { "HTTP/1.1 200 OK", "Content-Length: 0002, 2", "Content-Length: 02 ", "" },
+            chunks = { "ok" },
+        } })
+        local c = client.new("length_list", {
+            dict_obj = fake.new(clock_of(box)), clock = clock_of(box),
+        })
+        local res, err = c:request_uri("http://127.0.0.1/")
+        assert.is_nil(err)
+        assert.equal("ok", res.body)
+    end)
+
+    it("rejects ambiguous or invalid transfer framing", function()
+        local cases = {
+            { "Transfer-Encoding: chunked", "Content-Length: 2" },
+            { "Transfer-Encoding: gzip", "Content-Length: 0" },
+            { "Transfer-Encoding: chunked," },
+            { "Transfer-Encoding: chunked, chunked" },
+            { "Transfer-Encoding: " },
+        }
+        for i, fields in ipairs(cases) do
+            local lines = { "HTTP/1.1 200 OK" }
+            for _, field in ipairs(fields) do lines[#lines + 1] = field end
+            lines[#lines + 1] = ""
+            local script = scripted_http({ { lines = lines, chunks = { "ok" }, reused = 1 } })
+            local c = client.new("transfer" .. i, {
+                dict_obj = fake.new(clock_of(box)), clock = clock_of(box),
+            })
+            local res, err, meta = c:request_uri("http://127.0.0.1/")
+            assert.is_nil(res)
+            assert.is_truthy(err:find("transfer-encoding", 1, true))
+            assert.equal(1, meta.attempts)
+            assert.equal(0, script.keepalive())
+        end
+    end)
+
+    it("uses the exact final transfer coding to frame the body", function()
+        for i, coding in ipairs({ "notchunked", "chunked, gzip" }) do
+            local script = scripted_http({ {
+                lines = { "HTTP/1.1 200 OK", "Transfer-Encoding: " .. coding, "" },
+                chunks = { "wire" },
+            } })
+            local c = client.new("close_framing" .. i, {
+                dict_obj = fake.new(clock_of(box)), clock = clock_of(box),
+            })
+            local res, err = c:request_uri("http://127.0.0.1/")
+            assert.is_nil(err)
+            assert.equal("wire", res.body)
+            assert.equal(0, script.keepalive())
+        end
+    end)
+
+    it("rejects malformed and incomplete chunks without pooling", function()
+        local cases = {
+            { lines = { "2", "0", "" }, chunks = { "ok", "XY" }, err = "invalid chunk delimiter" },
+            { lines = { "2junk" }, chunks = {}, err = "invalid chunk size" },
+            { lines = { "20000000000000" }, chunks = {}, err = "invalid chunk size" },
+            { lines = { "0" }, chunks = {}, err = "closed" },
+        }
+        for i, ex in ipairs(cases) do
+            local lines = { "HTTP/1.1 200 OK", "Transfer-Encoding: chunked", "" }
+            for _, line in ipairs(ex.lines) do lines[#lines + 1] = line end
+            local script = scripted_http({ { lines = lines, chunks = ex.chunks } })
+            local c = client.new("bad_chunk" .. i, {
+                dict_obj = fake.new(clock_of(box)), clock = clock_of(box),
+            })
+            local res, err, meta = c:request_uri("http://127.0.0.1/")
+            assert.is_nil(res)
+            assert.equal(ex.err, err)
+            assert.equal(1, meta.attempts)
+            assert.equal(0, script.keepalive())
+            assert.is_true(script.closed() >= 1)
+        end
+    end)
+
+    it("reads chunk extensions, trailers, and repeated transfer headers", function()
+        local script = scripted_http({ {
+            lines = {
+                "HTTP/1.1 200 OK", "Transfer-Encoding: gzip", "Transfer-Encoding: CHUNKED", "",
+                '2;tag="a,b"', "000 ; done", "X-Trace: yes", "",
+            },
+            chunks = { "ok", "\r\n" },
+        } })
+        local c = client.new("chunk_extensions", {
+            dict_obj = fake.new(clock_of(box)), clock = clock_of(box),
+        })
+        local res, err = c:request_uri("http://127.0.0.1/")
+        assert.is_nil(err)
+        assert.equal("ok", res.body)
+        assert.equal(1, script.keepalive())
+    end)
+
+    it("records deadline-capped connect, send, and read timeouts", function()
+        local advance = function() box.now = box.now + 0.1 end
+        local cases = {
+            { connect_error = "timeout", on_connect = advance },
+            { request_error = "timeout", on_request = advance },
+            { lines = {}, line_error = "timeout", on_line_error = advance },
+            { lines = { "HTTP/1.1 200 OK" }, line_error = "timeout", on_line_error = advance },
+            {
+                lines = { "HTTP/1.1 200 OK", "Content-Length: 2", "" }, chunks = {},
+                body_error = "timeout", on_body = advance,
+            },
+        }
+        for i, ex in ipairs(cases) do
+            scripted_http({ ex })
+            local c = client.new("capped_timeout" .. i, {
+                dict_obj = fake.new(clock_of(box)), clock = clock_of(box),
+                estimator = { min_samples = 1 },
+            })
+            local res, err, _, ms, kind, class = c:attempt("http://127.0.0.1/",
+                { method = "GET" }, 100, nil, box.now)
+            assert.is_nil(res)
+            assert.equal("timeout", err)
+            assert.equal("deadline", class)
+            assert.equal("timeout", kind)
+            c:record_sample(kind, ms)
+            assert.equal(1, c.estimator:samples())
+            local p95 = c.estimator:percentile(95)
+            assert.is_true(p95 > 90 and p95 < 110)
+        end
+    end)
+
+    it("records cancellation once and excludes attempts that never start I/O", function()
+        scripted_http({ {
+            lines = { "HTTP/1.1 200 OK", "Content-Length: 2", "" }, chunks = { "ok" },
+            on_body = function() box.now = box.now + 0.6 end,
+        } })
+        local c = client.new("cancel_sample", {
+            dict_obj = fake.new(clock_of(box)), clock = clock_of(box),
+            deadline_ms = 500, estimator = { min_samples = 1 },
+        })
+        local res, _, meta = c:request_uri("http://127.0.0.1/")
+        assert.is_nil(res)
+        assert.is_true(meta.deadline_exceeded)
+        assert.equal(1, c.estimator:samples())
+
+        scripted_http({ {} })
+        local idle = client.new("not_started", {
+            dict_obj = fake.new(clock_of(box)), clock = clock_of(box),
+            deadline_ms = 0, estimator = { min_samples = 1 },
+        })
+        res, _, meta = idle:request_uri("http://127.0.0.1/")
+        assert.is_nil(res)
+        assert.is_true(meta.deadline_exceeded)
+        assert.equal(0, idle.estimator:samples())
     end)
 
     it("reads the final response that follows 100 and 103", function()

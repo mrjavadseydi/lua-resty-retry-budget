@@ -314,7 +314,7 @@ local function recv_exact(clock, deadline_ms, start, sock, read_timeout, n)
     local i = 0
     while got < n do
         local data, err, capped, partial = recv_some(clock, deadline_ms, start,
-            sock, read_timeout, n - got)
+            sock, read_timeout, math.min(n - got, 8192))
         if not data then
             if partial and partial ~= "" then
                 i = i + 1
@@ -355,7 +355,42 @@ local function is_chunked(headers)
     if type(te) ~= "string" then
         te = table.concat(te, ",")
     end
-    return te:lower():find("chunked", 1, true) ~= nil
+    local last, seen_chunked
+    for coding in (te .. ","):gmatch("(.-),") do
+        last = coding:match("^[ \t]*([!#$%%&'*+%.%^_`|~%w%-]+)[ \t]*$")
+        if not last then
+            return nil, "invalid transfer-encoding"
+        end
+        if last:lower() == "chunked" then
+            if seen_chunked then
+                return nil, "invalid transfer-encoding"
+            end
+            seen_chunked = true
+        end
+    end
+    return last:lower() == "chunked"
+end
+
+local function content_length(cl)
+    if cl == nil then
+        return nil
+    end
+    if type(cl) == "table" then
+        cl = table.concat(cl, ",")
+    end
+    local len
+    for value in (cl .. ","):gmatch("(.-),") do
+        local digits = value:match("^[ \t]*([0-9]+)[ \t]*$")
+        local n = digits and tonumber(digits)
+        if not n or n > 9007199254740991 then
+            return nil, "invalid content-length"
+        end
+        if len ~= nil and n ~= len then
+            return nil, "conflicting content-length"
+        end
+        len = n
+    end
+    return len
 end
 
 local function read_headers(clock, deadline_ms, start, sock, read_timeout, http_headers)
@@ -369,7 +404,7 @@ local function read_headers(clock, deadline_ms, start, sock, read_timeout, http_
         if line == "" then
             return headers, nil, capped
         end
-        local key, val = line:match("^([^:%s]+):%s*(.*)$")
+        local key, val = line:match("^([^:%s]+):[ \t]*(.*)$")
         if key then
             local prev = headers[key]
             if prev == nil then
@@ -392,9 +427,9 @@ local function read_chunked(clock, deadline_ms, start, sock, read_timeout)
         if not line then
             return nil, err, capped
         end
-        local hex = line:match("^(%x+)")
+        local hex = line:match("^(%x+)$") or line:match("^(%x+)[ \t]*;")
         local size = hex and tonumber(hex, 16)
-        if not size then
+        if not size or size > 9007199254740991 then
             return nil, "invalid chunk size", capped
         end
         if size == 0 then
@@ -402,9 +437,6 @@ local function read_chunked(clock, deadline_ms, start, sock, read_timeout)
                 local trailer, terr, tcapped = recv_line(clock, deadline_ms,
                     start, sock, read_timeout)
                 if not trailer then
-                    if terr == "closed" or terr == nil then
-                        break
-                    end
                     return nil, terr, tcapped
                 end
                 if trailer == "" then
@@ -425,29 +457,35 @@ local function read_chunked(clock, deadline_ms, start, sock, read_timeout)
         if not crlf then
             return nil, cerr, ccapped
         end
+        if crlf ~= "\r\n" then
+            return nil, "invalid chunk delimiter", ccapped
+        end
     end
 end
 
-local function read_body(clock, deadline_ms, start, sock, read_timeout, headers, method, status)
+local function read_body(clock, deadline_ms, start, sock, read_timeout, headers, method, status, httpc)
     -- 101 takes over the connection and has no HTTP body. Other 1xx
     -- responses are interim and are consumed before this is called.
     if method == "HEAD" or status == 204 or status == 304 or status == 101 then
         return "", nil, false
     end
-    if is_chunked(headers) then
+    local te, cl = headers["Transfer-Encoding"], headers["Content-Length"]
+    if te ~= nil and cl ~= nil then
+        return nil, "conflicting transfer-encoding and content-length", false
+    end
+    local chunked, terr = is_chunked(headers)
+    if terr then
+        return nil, terr, false
+    end
+    if chunked then
         return read_chunked(clock, deadline_ms, start, sock, read_timeout)
     end
-    local cl = headers["Content-Length"]
-    if type(cl) == "table" then
-        for i = 2, #cl do
-            if tonumber(cl[i]) ~= tonumber(cl[1]) then
-                return nil, "conflicting content-length", false
-            end
-        end
-        cl = cl[1]
+    local len, lerr = content_length(cl)
+    if lerr then
+        return nil, lerr, false
     end
-    local len = tonumber(cl or "")
-    if not len then
+    if len == nil then
+        httpc.keepalive = false
         local chunks = {}
         local n = 0
         while true do
@@ -568,6 +606,9 @@ function _M.attempt(self, uri, params, deadline_ms, slot, request_start)
         return nil, aerr, nil, nil, nil, "deadline"
     end
 
+    if slot then
+        slot.io_started = true
+    end
     ok, err = httpc:connect({
         scheme = scheme,
         host = host,
@@ -580,7 +621,7 @@ function _M.attempt(self, uri, params, deadline_ms, slot, request_start)
     if not ok then
         local class = class_of("connect", err, capped)
         local elapsed = (self.clock() - started) * 1000
-        local kind = (class == "connect_timeout") and "timeout" or nil
+        local kind = (err == "timeout" or err == "deadline") and "timeout" or nil
         close_httpc(httpc)
         return nil, err, nil, elapsed, kind, class
     end
@@ -589,7 +630,8 @@ function _M.attempt(self, uri, params, deadline_ms, slot, request_start)
     ok, aerr, capped = arm(self.clock, deadline_ms, origin, sock, self.send_timeout)
     if not ok then
         close_httpc(httpc)
-        return nil, aerr, nil, nil, nil, "deadline"
+        local elapsed = (self.clock() - started) * 1000
+        return nil, aerr, nil, elapsed, "timeout", "deadline"
     end
 
     local req = {
@@ -604,7 +646,7 @@ function _M.attempt(self, uri, params, deadline_ms, slot, request_start)
     if not ok then
         local class = class_of("send", err, capped, reused)
         local elapsed = (self.clock() - started) * 1000
-        local kind = (class == "send_timeout") and "timeout" or nil
+        local kind = (err == "timeout" or err == "deadline") and "timeout" or nil
         close_httpc(httpc)
         return nil, err, nil, elapsed, kind, class
     end
@@ -619,7 +661,7 @@ function _M.attempt(self, uri, params, deadline_ms, slot, request_start)
             local class = class_of(interim == 0 and "status" or "read", lerr,
                                    lcapped, reused)
             local elapsed = (self.clock() - started) * 1000
-            local kind = (class == "read_timeout") and "timeout" or nil
+            local kind = (lerr == "timeout" or lerr == "deadline") and "timeout" or nil
             close_httpc(httpc)
             return nil, lerr, nil, elapsed, kind, class
         end
@@ -636,7 +678,7 @@ function _M.attempt(self, uri, params, deadline_ms, slot, request_start)
         if not headers then
             local class = class_of("read", herr, hcapped)
             local elapsed = (self.clock() - started) * 1000
-            local kind = (class == "read_timeout") and "timeout" or nil
+            local kind = (herr == "timeout" or herr == "deadline") and "timeout" or nil
             close_httpc(httpc)
             return nil, herr, nil, elapsed, kind, class
         end
@@ -646,7 +688,7 @@ function _M.attempt(self, uri, params, deadline_ms, slot, request_start)
             if not ok then
                 local class = class_of("send", err, capped)
                 local elapsed = (self.clock() - started) * 1000
-                local kind = (class == "send_timeout") and "timeout" or nil
+                local kind = (err == "timeout" or err == "deadline") and "timeout" or nil
                 close_httpc(httpc)
                 return nil, err, nil, elapsed, kind, class
             end
@@ -668,11 +710,11 @@ function _M.attempt(self, uri, params, deadline_ms, slot, request_start)
     end
 
     local body, berr, bcapped = read_body(self.clock, deadline_ms, origin, sock,
-        self.read_timeout, headers, params.method, status)
+        self.read_timeout, headers, params.method, status, httpc)
     if not body then
         local class = class_of("read", berr, bcapped)
         local elapsed = (self.clock() - started) * 1000
-        local kind = (class == "read_timeout") and "timeout" or nil
+        local kind = (berr == "timeout" or berr == "deadline") and "timeout" or nil
         close_httpc(httpc)
         return nil, berr, nil, elapsed, kind, class
     end
@@ -713,7 +755,12 @@ local function attempt_with_deadline(self, uri, params, deadline_ms, start)
         -- Kill the reader before close(), which otherwise reports busy.
         ngx.thread.kill(attempt)
         close_httpc(slot.httpc)
-        return nil, "deadline", nil, nil, nil, "deadline"
+        local elapsed, kind
+        if slot.io_started then
+            elapsed = (self.clock() - slot.started) * 1000
+            kind = "timeout"
+        end
+        return nil, "deadline", nil, elapsed, kind, "deadline"
     end
     if not ok then
         close_httpc(slot.httpc)

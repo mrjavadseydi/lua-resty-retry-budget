@@ -106,7 +106,7 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
             return
         end
         slot.cancelled = true
-        if record_censored and not slot.is_hedge and slot.started then
+        if record_censored and slot.io_started then
             client.estimator:record((client.clock() - slot.started) * 1000)
         end
         if slot.httpc then
@@ -211,7 +211,7 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
         end
         if type(pkt) ~= "table" or pkt.id == nil then
             for _, slot in pairs(slots) do
-                cancel(slot, true)
+                cancel(slot, not slot.is_hedge)
             end
             stop_timers()
             meta.hedge_skipped = "wait"
@@ -225,7 +225,7 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
         remain = deadline.remaining_ms(deadline_ms, start, client.clock())
         if who == -1 or pkt.deadline or (remain and remain < 1) then
             for _, slot in pairs(slots) do
-                cancel(slot, false)
+                cancel(slot, true)
             end
             stop_timers()
             meta.deadline_exceeded = true
@@ -268,7 +268,7 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
             if client:response_wins(res, err, bad_waits) then
                 for id, other in pairs(slots) do
                     if id ~= who then
-                        cancel(other, true)
+                        cancel(other, not other.is_hedge)
                     end
                 end
                 stop_timers()

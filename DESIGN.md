@@ -237,6 +237,8 @@ Percentiles are ranks. Dropping a sample moves every later rank down.
 | A hedge attempt killed because attempt 1 won | no | its elapsed time is "how fast we noticed attempt 1", which is short |
 | Send or read timeout | yes | elapsed time, which sits on the configured timeout |
 | Connect timeout | yes | elapsed time, same rank argument |
+| Deadline expiry after I/O starts | yes, each pending attempt | elapsed time at cancellation, a censored sample |
+| Deadline expiry before I/O starts | no | no upstream latency was observed |
 | Connect error that is not a timeout (refused, reset, DNS) | no | that is not a latency |
 | Lua error inside the attempt (`pcall` failure) | no | no meaningful elapsed time |
 
@@ -334,6 +336,10 @@ Sequential loop: `record_request` once; attempt 1 does not withdraw; attempts `2
 Each attempt creates its own `httpc`. The parent `set_keepalive`s only after a full read. Errors `close`.
 
 For `Expect: 100-continue`, `send_request` sends only the headers. The attempt sends the deferred body once after the first `100`, then resumes reading interim and final responses. A final rejection before `100` leaves the body unsent. Deferred body writes share the request deadline and retain send-timeout classification.
+
+Response framing accepts only unsigned decimal Content-Length values with optional surrounding space or tab. Repeated fields and comma-separated lists must contain equal values. Lengths and chunk sizes above `2^53 - 1` are rejected to avoid precision loss in byte counts, and body reads are bounded to 8192 bytes per receive. Transfer-Encoding must be a list of coding names; only a final `chunked` coding uses the chunk parser, and other final codings are close-delimited. A response with both Transfer-Encoding and Content-Length is rejected. Chunk data must end in CRLF, and the last chunk must be followed by a complete trailer section ending in an empty line. Invalid framing closes the socket and is not retried.
+
+Sampling is independent of retry classification: a socket timeout capped by the deadline still contributes its elapsed time. Deadline cancellation records each pending attempt that started I/O, including hedges, once. An already recorded response or timeout is not recorded again when the remaining attempts are cancelled. Ordinary winner cancellation still excludes killed hedge attempts.
 
 ## Hedge state machine
 

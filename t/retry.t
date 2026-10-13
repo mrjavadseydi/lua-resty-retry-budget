@@ -150,6 +150,32 @@ server {
         }
     }
 
+    location = /framing {
+        content_by_lua_block {
+            local crlf = string.char(13, 10)
+            local replies = {
+                negative = { "Content-Length: -1", "payload" },
+                hexadecimal = { "Content-Length: 0x2", "ok" },
+                conflicting = { "Content-Length: 2" .. crlf .. "Content-Length: 3", "ok" },
+                te_cl = { "Transfer-Encoding: gzip" .. crlf .. "Content-Length: 0", "payload" },
+                bad_chunk = { "Transfer-Encoding: chunked", "2" .. crlf .. "okXY0" .. crlf .. crlf },
+                missing_last = { "Transfer-Encoding: chunked", "0" .. crlf },
+                length_list = { "Content-Length: 0002, 2", "ok" },
+                chunk_extensions = {
+                    "Transfer-Encoding: chunked",
+                    "2;tag=ok" .. crlf .. "ok" .. crlf .. "0" .. crlf .. "X-Trace: yes" .. crlf .. crlf,
+                },
+                close_coding = { "Transfer-Encoding: notchunked", "wire" },
+                chunk_not_final = { "Transfer-Encoding: chunked, gzip", "wire" },
+            }
+            local reply = assert(replies[ngx.var.arg_kind])
+            local sock = assert(ngx.req.socket(true))
+            sock:send("HTTP/1.1 200 OK" .. crlf .. "Connection: close" .. crlf
+                .. reply[1] .. crlf .. crlf .. reply[2])
+            return ngx.exit(444)
+        }
+    }
+
     location = /trickle {
         content_by_lua_block {
             ngx.status = 200
@@ -871,6 +897,7 @@ deferred
                 ngx.say(meta.attempts)
                 ngx.say(meta.hedged and "yes" or "no")
                 ngx.say(c.budget:stats().hedges_won)
+                ngx.say(c.estimator:samples())
             end
         }
     }
@@ -883,10 +910,115 @@ short
 2
 yes
 0
+2
 503
 yes
 short
 2
 yes
+0
+2
+--- timeout: 8
+
+
+=== TEST 18: malformed framing fails and valid framing keeps its body
+--- config
+    location = /t {
+        content_by_lua_block {
+            local c = assert(require("resty.retry_budget").new_client("framing", {
+                dict = "retry_budget", read_timeout = 500,
+            }))
+            local kinds = {
+                "negative", "hexadecimal", "conflicting", "te_cl", "bad_chunk", "missing_last",
+                "length_list", "chunk_extensions", "close_coding", "chunk_not_final",
+            }
+            for _, kind in ipairs(kinds) do
+                local res, err, meta = c:request_uri("http://127.0.0.1:1985/framing?kind=" .. kind)
+                ngx.say(res and res.body or err)
+                ngx.say(meta.attempts)
+            end
+        }
+    }
+--- request
+GET /t
+--- response_body
+invalid content-length
+1
+invalid content-length
+1
+conflicting content-length
+1
+conflicting transfer-encoding and content-length
+1
+invalid chunk delimiter
+1
+closed
+1
+ok
+1
+ok
+1
+wire
+1
+wire
+1
+--- timeout: 8
+
+
+=== TEST 19: deadline timeouts feed the histogram once per started attempt
+--- config
+    location = /t {
+        content_by_lua_block {
+            local rb = require "resty.retry_budget"
+            local options = {
+                false,
+                { enabled = true, delay = 200 },
+                { enabled = true, delay = 20 },
+            }
+            for i = 1, #options do
+                local c = assert(rb.new_client("deadline_sample" .. i, {
+                    dict = "retry_budget", max_attempts = 2, deadline_ms = 100,
+                    read_timeout = 2000, estimator = { min_samples = 1 },
+                }))
+                local res, _, meta = c:request_uri("http://127.0.0.1:1985/slow", nil, {
+                    hedge = options[i] or nil,
+                })
+                ngx.say(res == nil and "timeout" or "success")
+                ngx.say(meta.deadline_exceeded and "yes" or "no")
+                ngx.say(c.estimator:samples())
+                local p95 = c.estimator:percentile(95)
+                ngx.say(p95 and p95 > 80 and p95 < 300 and "tail recorded" or "missing")
+            end
+
+            local idle = assert(rb.new_client("idle_sample", {
+                dict = "retry_budget", deadline_ms = 0, estimator = { min_samples = 1 },
+            }))
+            idle:request_uri("http://127.0.0.1:1985/slow")
+            ngx.say(idle.estimator:samples())
+
+            local refused = assert(rb.new_client("refused_sample", {
+                dict = "retry_budget", max_attempts = 1, deadline_ms = 100,
+                estimator = { min_samples = 1 },
+            }))
+            refused:request_uri("http://127.0.0.1:1/")
+            ngx.say(refused.estimator:samples())
+        }
+    }
+--- request
+GET /t
+--- response_body
+timeout
+yes
+1
+tail recorded
+timeout
+yes
+1
+tail recorded
+timeout
+yes
+2
+tail recorded
+0
 0
 --- timeout: 8
