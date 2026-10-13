@@ -246,7 +246,7 @@ local function arm(clock, deadline_ms, start, sock, configured)
     return true, nil, capped
 end
 
-local function class_of(stage, err, capped)
+local function class_of(stage, err, capped, reused)
     if err == "deadline" then
         return "deadline"
     end
@@ -266,8 +266,9 @@ local function class_of(stage, err, capped)
         return "connect_error"
     end
     -- A reused keepalive connection the upstream already closed fails on
-    -- send or before the status line. Only idempotent requests retry.
-    if stage == "send" or stage == "status" then
+    -- send or before the status line. Only idempotent requests retry. On a
+    -- fresh connection the same error would repeat, so it is not a reset.
+    if reused and (stage == "send" or stage == "status") then
         return "reset"
     end
     return "transport"
@@ -439,7 +440,7 @@ local function read_body(clock, deadline_ms, start, sock, read_timeout, headers,
     local cl = headers["Content-Length"]
     if type(cl) == "table" then
         for i = 2, #cl do
-            if cl[i] ~= cl[1] then
+            if tonumber(cl[i]) ~= tonumber(cl[1]) then
                 return nil, "conflicting content-length", false
             end
         end
@@ -513,7 +514,7 @@ function _M.attempt(self, uri, params, deadline_ms, slot, request_start)
     local origin = request_start or started
     local httpc, err = self.http.new()
     if not httpc then
-        return nil, err or "no socket", nil, nil, nil, "connect_error"
+        return nil, err or "no socket", nil, nil, nil, "error"
     end
     if slot then
         slot.httpc = httpc
@@ -523,7 +524,7 @@ function _M.attempt(self, uri, params, deadline_ms, slot, request_start)
     local parsed, perr = httpc:parse_uri(uri, false)
     if not parsed then
         close_httpc(httpc)
-        return nil, perr, nil, nil, nil, "connect_error"
+        return nil, perr, nil, nil, nil, "error"
     end
     local scheme, host, port = parsed[1], parsed[2], parsed[3]
     local path = params.path or parsed[4]
@@ -553,6 +554,7 @@ function _M.attempt(self, uri, params, deadline_ms, slot, request_start)
         close_httpc(httpc)
         return nil, err, nil, elapsed, kind, class
     end
+    local reused = sock.getreusedtimes ~= nil and (sock:getreusedtimes() or 0) > 0
 
     ok, aerr, capped = arm(self.clock, deadline_ms, origin, sock, self.send_timeout)
     if not ok then
@@ -570,7 +572,7 @@ function _M.attempt(self, uri, params, deadline_ms, slot, request_start)
     }
     ok, err = httpc:send_request(req)
     if not ok then
-        local class = class_of("send", err, capped)
+        local class = class_of("send", err, capped, reused)
         local elapsed = (self.clock() - started) * 1000
         local kind = (class == "send_timeout") and "timeout" or nil
         close_httpc(httpc)
@@ -584,7 +586,7 @@ function _M.attempt(self, uri, params, deadline_ms, slot, request_start)
                                                sock, self.read_timeout)
         if not line then
             local class = class_of(interim == 0 and "status" or "read", lerr,
-                                   lcapped)
+                                   lcapped, reused)
             local elapsed = (self.clock() - started) * 1000
             local kind = (class == "read_timeout") and "timeout" or nil
             close_httpc(httpc)

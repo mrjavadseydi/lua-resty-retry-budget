@@ -154,6 +154,23 @@ describe("budget", function()
         assert.equal(1, closed_b:stats().rejected)
     end)
 
+    it("does not drive retries negative when the undo key was evicted", function()
+        local env = box(4)
+        local b = new_budget("evictgone", env, { fail_mode = "closed" })
+        local incr = env.dict.incr
+        env.dict.incr = function(d, key, value, init, ttl)
+            local v, err = incr(d, key, value, init, ttl)
+            if value == 1 and key:find(":t:", 1, true) then
+                d:delete(key)
+                return v, err, true
+            end
+            return v, err, false
+        end
+        assert.is_false(b:try_acquire())
+        env.dict.incr = incr
+        assert.equal(0, b:stats().retries)
+    end)
+
     it("refreshes only the previous second inside the current second", function()
         local env = box(10.2)
         local slow = new_budget("payments", env, {

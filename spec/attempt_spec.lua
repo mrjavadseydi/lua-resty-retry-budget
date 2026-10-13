@@ -43,6 +43,9 @@ local function scripted_http(exchanges, on_keepalive)
             local li, ci = 1, 1
             local timeouts = {}
             local sock = {}
+            function sock:getreusedtimes()
+                return ex.reused or 0
+            end
             function sock:settimeout(ms)
                 timeouts[#timeouts + 1] = ms
             end
@@ -75,6 +78,9 @@ local function scripted_http(exchanges, on_keepalive)
             end
             local httpc = { sock = sock, keepalive = true }
             function httpc:parse_uri()
+                if ex.bad_uri then
+                    return nil, "bad uri"
+                end
                 return { "http", "127.0.0.1", 80, "/", nil }
             end
             function httpc:connect()
@@ -189,7 +195,7 @@ describe("client attempts", function()
 
     it("keeps repeated headers and retries a closed pooled connection", function()
         scripted_http({
-            { lines = {}, chunks = {} },
+            { lines = {}, chunks = {}, reused = 1 },
             {
                 lines = {
                     "HTTP/1.1 200 OK",
@@ -214,6 +220,61 @@ describe("client attempts", function()
         assert.is_nil(err)
         assert.equal(2, meta.attempts)
         assert.same({ "a=1", "b=2" }, res.headers["Set-Cookie"])
+    end)
+
+    it("does not retry a fresh connection closed before the status line", function()
+        scripted_http({
+            { lines = {}, chunks = {} },
+            { lines = { "HTTP/1.1 200 OK", "Content-Length: 0", "" }, chunks = {} },
+        })
+        local c = client.new("fresh", {
+            dict = "retry_budget",
+            dict_obj = fake.new(clock_of(box)),
+            clock = clock_of(box),
+        })
+        local res, err, meta = c:request_uri("http://127.0.0.1/")
+        assert.is_nil(res)
+        assert.equal("closed", err)
+        assert.equal(1, meta.attempts)
+    end)
+
+    it("does not retry a URI that fails to parse", function()
+        scripted_http({
+            { bad_uri = true },
+            { lines = { "HTTP/1.1 200 OK", "Content-Length: 0", "" }, chunks = {} },
+        })
+        local c = client.new("baduri", {
+            dict = "retry_budget",
+            dict_obj = fake.new(clock_of(box)),
+            clock = clock_of(box),
+        })
+        local res, err, meta = c:request_uri("htp://bad uri")
+        assert.is_nil(res)
+        assert.equal("bad uri", err)
+        assert.equal(1, meta.attempts)
+    end)
+
+    it("accepts repeated Content-Length values that are numerically equal", function()
+        scripted_http({
+            {
+                lines = {
+                    "HTTP/1.1 200 OK",
+                    "Content-Length: 2",
+                    "Content-Length: 2 ",
+                    "",
+                },
+                chunks = { "ok" },
+            },
+        })
+        local c = client.new("dupcl", {
+            dict = "retry_budget",
+            dict_obj = fake.new(clock_of(box)),
+            clock = clock_of(box),
+            max_attempts = 1,
+        })
+        local res, err = c:request_uri("http://127.0.0.1/")
+        assert.is_nil(err)
+        assert.equal("ok", res.body)
     end)
 
     it("reads the final response that follows 100 and 103", function()

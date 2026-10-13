@@ -307,7 +307,7 @@ Retryable iff all of:
 
 Otherwise one attempt, `meta.retry_skipped = "streaming_body"` or `"non_idempotent"`. Hedges use the same predicate.
 
-A **response** is retried when `retry_on.status[status]` is true, or the 429 rule above matches. A **transport error** is retried when it was classified `connect_error` and `retry_on.connect_error` (default true), or classified `timeout` and `retry_on.timeout` (default **false**). A non-timeout error on send or before the status line (typically a pooled keepalive connection the upstream already closed) is classified `reset` and follows `retry_on.connect_error`. Errors after the status line are `transport` and never retried.
+A **response** is retried when `retry_on.status[status]` is true, or the 429 rule above matches. A **transport error** is retried when it was classified `connect_error` and `retry_on.connect_error` (default true), or classified `timeout` and `retry_on.timeout` (default **false**). A non-timeout error on send or before the status line on a reused keepalive connection (one the upstream already closed) is classified `reset` and follows `retry_on.connect_error`; on a fresh connection it is `transport`. A URI that fails to parse is `error` and never retried. Errors after the status line are `transport` and never retried.
 
 Default `retry_on.status`: 502, 503, 504. Built into a lookup table in `new()`.
 

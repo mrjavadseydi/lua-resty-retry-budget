@@ -141,7 +141,7 @@ loop so those cases stay distinct.
 | `fail_mode` | `"open"` | `"open"` or `"closed"` |
 | `backoff.base_ms` | `25` | full jitter, `base * 2^(attempt-1)` |
 | `backoff.max_ms` | `1000` | cap, also the cap for `Retry-After` |
-| `retry_on.connect_error` | `true` | refused, DNS, connect timeout, and a reset before the status line |
+| `retry_on.connect_error` | `true` | refused, DNS, connect timeout, and a reused keepalive connection that fails before the status line |
 | `retry_on.timeout` | `false` | send or read timeout |
 | `retry_on.status` | `502, 503, 504` | |
 | `idempotent_methods` | `GET`, `HEAD`, `OPTIONS` | list `{ "GET" }` or set `{ GET = true }` |

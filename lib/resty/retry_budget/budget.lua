@@ -421,8 +421,10 @@ function _M.try_acquire(self)
     if forcible then
         note(self, "dict_full", "shared dict evicted live entries")
         if self.fail_mode == "closed" then
-            -- Denied, so it counts as rejected, not as a sent retry.
-            self.dict:incr(self._cache.t_key, -1, 0, self.ttl)
+            -- Denied, so it counts as rejected, not as a sent retry. No
+            -- init: if the key was evicted meanwhile, there is nothing to
+            -- undo, and init would create it at -1.
+            self.dict:incr(self._cache.t_key, -1)
             self.dict:incr(self._cache.j_key, 1, 0, self.ttl)
             return false
         end
