@@ -21,7 +21,7 @@ jobs:
           luarocks install busted
           luarocks install luacheck
       - name: Rockspec builds and installs
-        run: luarocks make lua-resty-retry-budget-0.1.0-1.rockspec
+        run: luarocks make lua-resty-retry-budget-0.2.0-1.rockspec
       - name: Lint and unit tests
         run: |
           make lint LUAJIT=luajit

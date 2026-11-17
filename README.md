@@ -19,7 +19,7 @@ need `resty.core.shdict` (loaded by default in OpenResty 1.21).
 ```bash
 luarocks install lua-resty-retry-budget   # pulls in lua-resty-http
 # or, from a checkout:
-luarocks make lua-resty-retry-budget-0.1.0-1.rockspec
+luarocks make lua-resty-retry-budget-0.2.0-1.rockspec
 ```
 
 ```nginx
@@ -61,7 +61,10 @@ retry-budget: client API is not available in phase "log"
 ```
 
 Hoist the client (or the budget) to file scope so the per-worker window cache
-stays warm. Constructing one per request re-sums the window every time.
+stays warm. Constructing one per request re-sums the window every time. Use
+static, low-cardinality upstream names (such as `"payments"`, never per-URL or
+per-user strings): registered names and per-worker caches live for the lifetime
+of the zone/worker.
 
 ## Budget
 
@@ -282,12 +285,10 @@ function _M.run()
     local n = (ctx.rb_attempt or 0) + 1
     ctx.rb_attempt = n
 
-    local may_arm = n < MAX_ATTEMPTS
     if n == 1 then
         budget:record_request()
-    elseif not budget:try_acquire() then
+    else
         budget:record_retry()   -- nginx already committed to this send
-        may_arm = false
     end
 
     local ok, err = balancer.set_current_peer("10.0.0.1", 8080)
@@ -296,7 +297,7 @@ function _M.run()
         return
     end
 
-    if may_arm and budget:can_acquire() then
+    if n < MAX_ATTEMPTS and budget:can_acquire() then
         ok, err = balancer.set_more_tries(1)
         if not ok then
             ngx.log(ngx.ERR, "[retry-budget] key=payments ", err)
@@ -382,17 +383,21 @@ Soft dependency. Nothing is required unless you call it.
 ```lua
 local prometheus = require("prometheus").init("prometheus_metrics")
 local prom = require "resty.retry_budget.prometheus"
-prom.register(prometheus)
+prom.register(prometheus, { dict = "retry_budget" })
 
 -- scrape location, before collect()
 prom.observe()
 prometheus:collect()
 ```
 
+Passing `{ dict = "retry_budget" }` (or `{ dicts = { ... } }`) lets a worker
+that has not handled traffic yet still discover budgets from shared memory.
+
 The series are window gauges (`retry_budget_requests_window`,
-`retry_budget_retries_window`, `retry_budget_retries_rejected_window`,
-`retry_budget_hedges_sent_window`, `retry_budget_hedges_won_window`,
-`retry_budget_dict_errors_window`, `retry_budget_latency_ms`). Each one is
+`retry_budget_retries_window`, `retry_budget_allowance_window`,
+`retry_budget_retries_rejected_window`, `retry_budget_hedges_sent_window`,
+`retry_budget_hedges_won_window`, `retry_budget_dict_errors_window`,
+`retry_budget_latency_ms`). Each one is
 labeled `budget` and `dict`. Latency also has `quantile` (`0.5`, `0.95`,
 `0.99`). Read them directly. `rate()` is the wrong function for a window
 count. A percentile with no samples in the current window is set to NaN,
