@@ -28,6 +28,9 @@ end
 -- body chunks returned by receiveany.
 local function scripted_http(exchanges, on_keepalive)
     local connect_timeouts = {}
+    local connect_opts = {}
+    local keepalive_args = {}
+    local request_headers = {}
     local keepalive = 0
     local closed = 0
     local attempt_n = 0
@@ -92,18 +95,20 @@ local function scripted_http(exchanges, on_keepalive)
                 end
                 return { "http", "127.0.0.1", 80, "/", nil }
             end
-            function httpc:connect()
+            function httpc:connect(opts)
                 connect_timeouts[#connect_timeouts + 1] = timeouts[#timeouts]
+                connect_opts[#connect_opts + 1] = opts
                 if ex.on_connect then ex.on_connect() end
                 if ex.connect_error then return nil, ex.connect_error end
                 return true
             end
-            function httpc:send_request()
+            function httpc:send_request(req)
+                request_headers[#request_headers + 1] = req and req.headers
                 if ex.on_request then ex.on_request() end
                 if ex.request_error then return nil, ex.request_error end
                 return true
             end
-            function httpc:set_keepalive()
+            function httpc:set_keepalive(timeout, pool)
                 if self.keepalive == false then
                     return nil, "connection must be closed"
                 end
@@ -111,6 +116,7 @@ local function scripted_http(exchanges, on_keepalive)
                     on_keepalive(li, ex.lines)
                 end
                 keepalive = keepalive + 1
+                keepalive_args[#keepalive_args + 1] = { timeout, pool }
                 return true
             end
             function httpc:close()
@@ -121,6 +127,9 @@ local function scripted_http(exchanges, on_keepalive)
     }
     return {
         connect_timeouts = connect_timeouts,
+        connect_opts = connect_opts,
+        keepalive_args = keepalive_args,
+        request_headers = request_headers,
         sent = sent,
         keepalive = function()
             return keepalive
@@ -614,5 +623,203 @@ describe("client attempts", function()
         assert.equal(101, res.status)
         assert.equal(0, script.keepalive())
         assert.is_true(script.closed() >= 1)
+    end)
+
+    it("normalizes Expect: 100-Continue and closes socket on early rejection", function()
+        local script = scripted_http({
+            {
+                lines = {
+                    "HTTP/1.1 100 Continue", "",
+                    "HTTP/1.1 200 OK", "Content-Length: 2", "",
+                },
+                chunks = { "ok" },
+            },
+            {
+                lines = {
+                    "HTTP/1.1 417 Expectation Failed",
+                    "Content-Length: 0",
+                    "",
+                },
+                chunks = {},
+            },
+        })
+        local c = client.new("continue_case", {
+            dict_obj = fake.new(clock_of(box)),
+            clock = clock_of(box),
+        })
+        local res, err = c:request_uri("http://127.0.0.1/", {
+            method = "POST",
+            body = "hello",
+            headers = { Expect = "100-Continue" },
+        })
+        assert.is_nil(err)
+        assert.equal(200, res.status)
+        assert.equal("100-continue", script.request_headers[1].Expect)
+        assert.same({ "hello" }, script.sent)
+        assert.equal(1, script.keepalive())
+
+        res, err = c:request_uri("http://127.0.0.1/", {
+            method = "POST",
+            body = "hello",
+            headers = { Expect = "100-Continue" },
+        })
+        assert.is_nil(err)
+        assert.equal(417, res.status)
+        -- Still 1: the rejected Expect connection with unsent body was closed, not pooled.
+        assert.equal(1, script.keepalive())
+        assert.is_true(script.closed() >= 1)
+    end)
+
+    it("rejects malformed status lines and header lines and trims header OWS", function()
+        local bad_lines = {
+            { "JUNK/1.1 200 OK", "Content-Length: 0", "" },
+            { "HTTP/1.1 2000 OK", "Content-Length: 0", "" },
+            { "HTTP/1.1 0x1 OK", "Content-Length: 0", "" },
+            { "HTTP/1.1 099 OK", "Content-Length: 0", "" },
+            { "HTTP/1.1 200 OK", "Content-Length : 0", "" },
+            { "HTTP/1.1 200 OK", "MalformedHeaderLine", "" },
+        }
+        for i, lines in ipairs(bad_lines) do
+            local script = scripted_http({ { lines = lines, chunks = {} } })
+            local c = client.new("bad_proto" .. i, {
+                dict_obj = fake.new(clock_of(box)),
+                clock = clock_of(box),
+            })
+            local res, err, meta = c:request_uri("http://127.0.0.1/")
+            assert.is_nil(res)
+            assert.is_truthy(err)
+            assert.equal(1, meta.attempts)
+            assert.equal(0, script.keepalive())
+        end
+
+        scripted_http({
+            {
+                lines = {
+                    "HTTP/1.1 429",
+                    "Retry-After: 1   ",
+                    "Content-Length: 0",
+                    "",
+                },
+                chunks = {},
+            },
+            {
+                lines = { "HTTP/1.1 200", "Content-Length: 2", "" },
+                chunks = { "ok" },
+            },
+        })
+        local c = client.new("ows_ra", {
+            dict_obj = fake.new(clock_of(box)),
+            clock = clock_of(box),
+        })
+        local res, err, meta = c:request_uri("http://127.0.0.1/")
+        assert.is_nil(err)
+        assert.equal(200, res.status)
+        assert.equal(2, meta.attempts)
+    end)
+
+    it("forwards connect TLS/pool options and per-call keepalive settings", function()
+        local script = scripted_http({
+            {
+                lines = { "HTTP/1.1 200 OK", "Content-Length: 2", "" },
+                chunks = { "ok" },
+            },
+            {
+                lines = { "HTTP/1.1 200 OK", "Content-Length: 2", "" },
+                chunks = { "ok" },
+            },
+        })
+        local c = client.new("conn_opts", {
+            dict_obj = fake.new(clock_of(box)),
+            clock = clock_of(box),
+            keepalive_timeout = 10000,
+            keepalive_pool = 16,
+        })
+        local res, err = c:request_uri("https://127.0.0.1/", {
+            ssl_client_cert = "cert",
+            ssl_client_priv_key = "key",
+            ssl_session_reuse = false,
+            backlog = 32,
+            proxy_opts = { http_proxy = "http://proxy:8080" },
+            keepalive_timeout = 5000,
+            keepalive_pool = 8,
+        })
+        assert.is_nil(err)
+        assert.equal(200, res.status)
+        assert.equal("cert", script.connect_opts[1].ssl_client_cert)
+        assert.equal("key", script.connect_opts[1].ssl_client_priv_key)
+        assert.equal(false, script.connect_opts[1].ssl_session_reuse)
+        assert.equal(32, script.connect_opts[1].backlog)
+        assert.same({ http_proxy = "http://proxy:8080" }, script.connect_opts[1].proxy_opts)
+        assert.same({ 5000, 8 }, script.keepalive_args[1])
+
+        res, err = c:request_uri("http://127.0.0.1/", { keepalive = false })
+        assert.is_nil(err)
+        assert.equal(200, res.status)
+        assert.equal(1, script.keepalive())
+    end)
+
+    it("keeps sub-ms pre-deadline responses, preserves 503 on retry deadline, and skips fast connect errors", function()
+        scripted_http({
+            {
+                lines = { "HTTP/1.1 200 OK", "Content-Length: 2", "" },
+                chunks = { "ok" },
+                on_body = function() box.now = box.now + 0.4995 end,
+            },
+        })
+        local c = client.new("subms_dead", {
+            dict_obj = fake.new(clock_of(box)),
+            clock = clock_of(box),
+            deadline_ms = 500,
+        })
+        local res, err, meta = c:request_uri("http://127.0.0.1/")
+        assert.is_nil(err)
+        assert.equal(200, res.status)
+        assert.is_false(meta.deadline_exceeded)
+
+        scripted_http({
+            {
+                lines = { "HTTP/1.1 503 Service Unavailable", "Content-Length: 2", "" },
+                chunks = { "no" },
+                on_body = function() box.now = box.now + 0.35 end,
+            },
+            {
+                lines = { "HTTP/1.1 200 OK", "Content-Length: 2", "" },
+                chunks = { "ok" },
+                on_body = function() box.now = box.now + 0.35 end,
+            },
+        })
+        local c2 = client.new("preserve_503", {
+            dict_obj = fake.new(clock_of(box)),
+            clock = clock_of(box),
+            random = function() return 0 end,
+            max_attempts = 2,
+            deadline_ms = 500,
+            backoff = { base_ms = 0, max_ms = 0 },
+        })
+        res, err, meta = c2:request_uri("http://127.0.0.1/")
+        assert.is_nil(err)
+        assert.equal(503, res.status)
+        assert.is_true(meta.deadline_exceeded)
+        assert.equal(2, meta.attempts)
+        assert.equal(1, meta.winner)
+
+        scripted_http({
+            {
+                connect_error = "connection refused",
+                on_connect = function() box.now = box.now + 0.1 end,
+            },
+        })
+        local c3 = client.new("refused_at_dead", {
+            dict_obj = fake.new(clock_of(box)),
+            clock = clock_of(box),
+            max_attempts = 1,
+            deadline_ms = 100,
+            estimator = { min_samples = 1 },
+        })
+        res, err, meta = c3:request_uri("http://127.0.0.1/")
+        assert.is_nil(res)
+        assert.is_truthy(err)
+        assert.is_true(meta.deadline_exceeded)
+        assert.equal(0, c3.estimator:samples())
     end)
 end)

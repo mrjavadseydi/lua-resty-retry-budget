@@ -275,5 +275,49 @@ describe("budget", function()
         assert.is_truthy(err:find("illegal"))
         _, err = new_budget("payments", env, { window_sec = 1.5 })
         assert.is_truthy(err:find("window_sec"))
+        _, err = new_budget("payments", env, { retry_ratio = 0 / 0 })
+        assert.is_truthy(err:find("retry_ratio"))
+        _, err = new_budget("payments", env, { min_retries_per_sec = 0 / 0 })
+        assert.is_truthy(err:find("min_retries_per_sec"))
+        _, err = new_budget("payments", env, { min_retries_per_sec = math.huge })
+        assert.is_truthy(err:find("min_retries_per_sec"))
+        _, err = new_budget("payments", env, { refresh_interval = 0 / 0 })
+        assert.is_truthy(err:find("refresh_interval"))
+    end)
+
+    it("suppresses dict_full log floods even when limiter keys are evicted", function()
+        local env = box(5)
+        local b = new_budget("evictlog", env)
+        for _ = 1, 5 do
+            env.dict._set_forcible(true)
+            assert.is_true(b:record_request())
+            env.dict:delete("rb:evictlog:log:dict_full")
+        end
+        assert.equal(1, #logs)
+
+        local env2 = box(5)
+        local b2 = budget.new("evictlog", {
+            dict = "other",
+            dict_obj = env2.dict,
+            clock = clock_of(env2),
+        })
+        env2.dict._set_forcible(true)
+        assert.is_true(b2:record_request())
+        assert.equal(2, #logs)
+    end)
+
+    it("discovers shared-dict budgets from extra_zones on a cold worker", function()
+        local env = box(10)
+        _G.ngx.now = function()
+            return env.now
+        end
+        _G.ngx.shared = { retry_budget = env.dict }
+        local b = new_budget("payments", env)
+        assert.is_true(b:record_request())
+
+        budget._reset()
+        assert.same({}, budget.stats_all())
+        local all = budget.stats_all({ "retry_budget" })
+        assert.equal(1, all.retry_budget.payments.requests)
     end)
 end)

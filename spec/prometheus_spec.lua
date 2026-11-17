@@ -158,4 +158,23 @@ describe("prometheus", function()
         local second = last_p50()
         assert.is_true(second.value ~= second.value)
     end)
+
+    it("observes configured dict on a cold worker", function()
+        local clock = clock_of(box)
+        _G.ngx.now = clock
+        _G.ngx.shared = { retry_budget = box.dict }
+        local b = budget.new("pay", {
+            dict = "retry_budget",
+            dict_obj = box.dict,
+            clock = clock,
+        })
+        assert.is_true(b:record_request())
+
+        budget._reset()
+        histogram._reset()
+        local inst, metrics = new_prom()
+        assert.is_true(prom.register(inst, { dict = "retry_budget" }))
+        assert.is_true(prom.observe())
+        assert.equal(1, metrics.retry_budget_requests_window.samples[1].value)
+    end)
 end)

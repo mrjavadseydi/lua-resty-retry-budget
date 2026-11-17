@@ -17,7 +17,7 @@ _M.RATIO = RATIO
 -- Samples under 1 ms share bucket 1, whose lower edge is 1 ms, so a
 -- percentile never comes back below 1 ms.
 function _M.bucket_of(ms)
-    if ms < MIN_MS then
+    if type(ms) ~= "number" or ms ~= ms or ms < MIN_MS then
         return 1
     end
     local x = math.log(ms / MIN_MS) / LN
@@ -100,9 +100,11 @@ local function refresh(st, now)
     for s = from, slot do
         local base = st.prefix .. s .. ":"
         for i = 1, N do
-            local v = dict:get(base .. i) or 0
-            counts[i] = counts[i] + v
-            total = total + v
+            local v = dict:get(base .. i)
+            if type(v) == "number" then
+                counts[i] = counts[i] + v
+                total = total + v
+            end
         end
     end
     st.total = total
@@ -112,14 +114,24 @@ local function refresh(st, now)
 end
 
 local function ensure_timer(st)
-    if st.timer or st.timer_failed then
+    if st.timer then
         return
     end
     local n = ngx
     if not n or not n.timer or not n.timer.at then
         return
     end
-    local ok, err = n.timer.at(1, function(premature)
+    if n.get_phase then
+        local phase = n.get_phase()
+        if phase == "init" or phase == "set" then
+            return
+        end
+    end
+    local now_check = st.clock()
+    if st.timer_retry_at and now_check < st.timer_retry_at then
+        return
+    end
+    local pok, ok, err = pcall(n.timer.at, 1, function(premature)
         if premature then
             st.timer = false
             return
@@ -129,17 +141,27 @@ local function ensure_timer(st)
         st.timer = false
         ensure_timer(st)
     end)
+    if not pok then
+        err = ok
+        ok = nil
+    end
     if ok then
         st.timer = true
+        st.timer_retry_at = nil
     else
-        st.timer_failed = true
+        st.timer_retry_at = now_check + 5
         log.warn(st.dict, st.name, "timer",
-                 "histogram refresh timer failed: " .. (err or ""), st.clock())
+                 "histogram refresh timer failed: " .. tostring(err or ""),
+                 now_check)
     end
 end
 
-local function quantile(st, p)
-    if st.total == 0 or st.total < st.min_samples then
+local function quantile(st, p, min_samples)
+    local need = min_samples
+    if need == nil then
+        need = st.min_samples
+    end
+    if st.total == 0 or st.total < need then
         return nil, "not enough samples"
     end
     local target = math.ceil(p / 100 * st.total)
@@ -264,14 +286,19 @@ function _M.samples(self)
     return st.total
 end
 
-function _M.percentile(self, p)
-    if type(p) ~= "number" or p < 1 or p > 100 then
+function _M.percentile(self, p, min_samples)
+    if type(p) ~= "number" or not (p >= 1 and p <= 100) then
         return nil, "retry-budget: percentile out of range"
+    end
+    if min_samples ~= nil and (type(min_samples) ~= "number"
+        or min_samples < 0
+        or min_samples ~= math.floor(min_samples)) then
+        return nil, "retry-budget: min_samples must be an integer >= 0"
     end
     local st = self._st
     refresh(st, st.clock())
     ensure_timer(st)
-    return quantile(st, p)
+    return quantile(st, p, min_samples)
 end
 
 local function parse_hcfg(raw)
@@ -294,7 +321,7 @@ function _M.percentiles_for(dict, zone, name, clock)
         if not w then
             return empty
         end
-        local est, err = _M.new(name, {
+        local est = _M.new(name, {
             dict = zone,
             dict_obj = dict,
             clock = clock,

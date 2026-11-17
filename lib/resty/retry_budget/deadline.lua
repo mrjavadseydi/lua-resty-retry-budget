@@ -15,8 +15,14 @@ function _M.next_timeout_ms(remaining, configured)
     if remaining == nil then
         return configured
     end
+    -- `(now - start) * 1000` on ~1.7e9 unix timestamps can round 1 ms down
+    -- to ~0.9999 ms; clamp back to 1 ms so settimeout does not truncate to 0.
     if remaining < 1 then
-        return nil
+        if remaining >= 1 - 1e-3 then
+            remaining = 1
+        else
+            return nil
+        end
     end
     if configured < remaining then
         return configured

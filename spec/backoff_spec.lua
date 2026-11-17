@@ -23,21 +23,31 @@ describe("backoff", function()
         assert.equal(1000, backoff.delay_ms(20, 25, 1000, function()
             return 1
         end))
+        assert.equal(0, backoff.delay_ms(2000, 0, 1000, function()
+            return 1
+        end))
     end)
 
     it("parses Retry-After delta-seconds and http dates", function()
         assert.equal(2000, backoff.retry_after_ms("2", 100))
+        assert.equal(2000, backoff.retry_after_ms(" \t2 \t", 100))
         assert.is_nil(backoff.retry_after_ms("", 0))
+        assert.is_nil(backoff.retry_after_ms("   ", 0))
         assert.is_nil(backoff.retry_after_ms("soon", 0))
 
         local saved = _G.ngx
         _G.ngx = {
-            parse_http_time = function()
-                return 100
+            parse_http_time = function(s)
+                if s == "Sun, 06 Nov 1994 08:49:37 GMT" then
+                    return 100
+                end
+                return nil
             end,
         }
         assert.equal(5000, backoff.retry_after_ms(
             "Sun, 06 Nov 1994 08:49:37 GMT", 95))
+        assert.equal(5000, backoff.retry_after_ms(
+            "  Sun, 06 Nov 1994 08:49:37 GMT\t ", 95))
         assert.equal(0, backoff.retry_after_ms(
             "Sun, 06 Nov 1994 08:49:37 GMT", 150))
         _G.ngx = saved

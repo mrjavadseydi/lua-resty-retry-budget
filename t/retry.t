@@ -245,6 +245,57 @@ server {
             ngx.say("slow")
         }
     }
+
+    location = /hedge-two {
+        content_by_lua_block {
+            local n = ngx.shared.state:incr("hedgetwo", 1, 0)
+            ngx.header["Connection"] = "close"
+            if n == 1 then
+                ngx.sleep(0.6)
+                ngx.say("slow")
+                return
+            end
+            if n == 2 then
+                ngx.status = 503
+                ngx.say("hedge1-fail")
+                return
+            end
+            ngx.say("hedge2-ok")
+        }
+    }
+
+    location = /hedge-fallback {
+        content_by_lua_block {
+            local n = ngx.shared.state:incr("hedgefb", 1, 0)
+            ngx.header["Connection"] = "close"
+            if n == 1 then
+                ngx.sleep(0.25)
+                ngx.say("too-late")
+                return
+            end
+            if n == 2 then
+                ngx.sleep(0.08)
+                ngx.status = 503
+                ngx.say("hedge-503")
+                return
+            end
+            ngx.say("retry-200")
+        }
+    }
+
+    location = /reject-keepalive {
+        content_by_lua_block {
+            local n = ngx.shared.state:incr("rejka", 1, 0)
+            if n == 1 then
+                ngx.req.clear_header("Expect")
+                ngx.status = 417
+                ngx.header["Content-Length"] = "2"
+                ngx.print("no")
+                return
+            end
+            ngx.say("conn=", ngx.var.connection_requests)
+        }
+    }
 }
 EOF
     $block->set_value("http_config", $block->http_config . $extra);
@@ -1021,4 +1072,93 @@ yes
 tail recorded
 0
 0
+--- timeout: 8
+
+
+=== TEST 20: hedge min_samples override, max_hedges > 1, and retryable hedge fallback
+--- config
+    location = /t {
+        content_by_lua_block {
+            local rb = require "resty.retry_budget"
+
+            -- 1. hedge.min_samples lower than estimator.min_samples (100)
+            local c1 = assert(rb.new_client("minoverride", {
+                dict = "retry_budget", max_attempts = 2,
+                min_retries_per_sec = 100,
+                estimator = { min_samples = 100 },
+            }))
+            for _ = 1, 5 do
+                c1.estimator:record(30)
+            end
+            local res, _, meta = c1:request_uri("http://127.0.0.1:1985/hedge", nil, {
+                hedge = { enabled = true, delay = "p95", min_samples = 5 },
+            })
+            ngx.say(res and res.body:gsub("%s+$", "") or "err")
+            ngx.say(meta.hedged and "yes" or "no")
+
+            -- 2. max_hedges = 2 still fires hedge 2 when hedge 1 fails fast
+            local c2 = assert(rb.new_client("multihedge", {
+                dict = "retry_budget", max_attempts = 3,
+                min_retries_per_sec = 100,
+            }))
+            res, _, meta = c2:request_uri("http://127.0.0.1:1985/hedge-two", nil, {
+                hedge = { enabled = true, delay = 40, max_hedges = 2 },
+            })
+            ngx.say(res and res.body:gsub("%s+$", "") or "err")
+            ngx.say(meta.winner)
+            ngx.say(meta.attempts)
+
+            -- 3. attempt 1 read-timeout + hedge 503 retries attempt 3 via 503 fallback
+            local c3 = assert(rb.new_client("fbhedge", {
+                dict = "retry_budget", max_attempts = 3,
+                min_retries_per_sec = 100,
+                read_timeout = 100,
+                backoff = { base_ms = 1, max_ms = 5 },
+            }))
+            res, _, meta = c3:request_uri("http://127.0.0.1:1985/hedge-fallback", nil, {
+                hedge = { enabled = true, delay = 40, max_hedges = 1 },
+            })
+            ngx.say(res and res.body:gsub("%s+$", "") or "err")
+            ngx.say(meta.winner)
+            ngx.say(meta.attempts)
+        }
+    }
+--- request
+GET /t
+--- response_body
+fast
+yes
+hedge2-ok
+3
+3
+retry-200
+3
+3
+--- timeout: 8
+
+
+=== TEST 21: rejected Expect: 100-Continue closes connection instead of poisoning keepalive pool
+--- config
+    location = /t {
+        content_by_lua_block {
+            local c = assert(require("resty.retry_budget").new_client("rejka", {
+                dict = "retry_budget",
+                keepalive_timeout = 60000,
+                keepalive_pool = 8,
+            }))
+            local res = c:request_uri("http://127.0.0.1:1985/reject-keepalive", {
+                method = "POST",
+                body = "hello",
+                headers = { Expect = "100-Continue", ["Content-Length"] = "5" },
+            })
+            ngx.say(res and res.status or "err")
+            local res2, err2 = c:request_uri("http://127.0.0.1:1985/reject-keepalive")
+            ngx.say(res2 and res2.body:gsub("%s+$", "") or err2)
+        }
+    }
+--- request
+GET /t
+--- response_body
+417
+conn=1
 --- timeout: 8

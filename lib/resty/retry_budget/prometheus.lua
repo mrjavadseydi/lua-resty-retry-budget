@@ -6,6 +6,7 @@
 local _M = {}
 
 local gauges
+local watch_zones
 
 local function ensure_prom(prom)
     if type(prom) == "table" and prom.gauge then
@@ -18,10 +19,18 @@ local function ensure_prom(prom)
     return nil, "pass an initialized prometheus instance"
 end
 
-function _M.register(prom)
+function _M.register(prom, opts)
     local inst, err = ensure_prom(prom)
     if not inst then
         return nil, err
+    end
+    watch_zones = nil
+    if type(opts) == "table" then
+        if type(opts.dicts) == "table" then
+            watch_zones = opts.dicts
+        elseif type(opts.dict) == "string" and opts.dict ~= "" then
+            watch_zones = { opts.dict }
+        end
     end
     gauges = {
         requests = inst:gauge("retry_budget_requests_window",
@@ -51,6 +60,7 @@ end
 
 function _M._reset()
     gauges = nil
+    watch_zones = nil
 end
 
 function _M.observe()
@@ -58,7 +68,7 @@ function _M.observe()
         return nil, "retry-budget: prometheus.register was not called"
     end
     local rb = require "resty.retry_budget"
-    local all = rb.stats()
+    local all = rb.stats(watch_zones)
     -- NaN clears a percentile whose samples have left the window.
     -- A number that is only omitted would keep the previous scrape.
     local missing = 0 / 0

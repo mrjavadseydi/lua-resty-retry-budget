@@ -16,14 +16,16 @@ jobs:
       - uses: leafo/gh-actions-luarocks@v5
         with:
           luaRocksVersion: "3.12.2" # JSON manifests avoid LuaJIT's constant limit.
-      - name: Install busted
-        run: luarocks install busted
+      - name: Install busted and luacheck
+        run: |
+          luarocks install busted
+          luarocks install luacheck
       - name: Rockspec builds and installs
         run: luarocks make lua-resty-retry-budget-0.1.0-1.rockspec
-      - name: Unit tests and global-write check
+      - name: Lint and unit tests
         run: |
+          make lint LUAJIT=luajit
           make test
-          make gset LUAJIT=luajit
 
   integration:
     runs-on: ubuntu-latest

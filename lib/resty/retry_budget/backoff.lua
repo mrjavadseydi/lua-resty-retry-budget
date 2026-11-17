@@ -6,6 +6,8 @@ local _M = {}
 function _M.delay_ms(attempt, base_ms, max_ms, random)
     if attempt < 1 then
         attempt = 1
+    elseif attempt > 64 then
+        attempt = 64
     end
     local cap = base_ms * (2 ^ (attempt - 1))
     if cap ~= cap or cap > max_ms then
@@ -26,7 +28,11 @@ end
 -- Delta-seconds, or an HTTP-date via ngx.parse_http_time.
 -- Returns milliseconds from `now`, or nil when the header is unusable.
 function _M.retry_after_ms(header, now)
-    if type(header) ~= "string" or header == "" then
+    if type(header) ~= "string" then
+        return nil
+    end
+    header = header:match("^[ \t]*(.-)[ \t]*$")
+    if header == "" then
         return nil
     end
     if header:match("^%d+$") then

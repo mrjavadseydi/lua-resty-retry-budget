@@ -7,26 +7,33 @@ local _M = {}
 local worker_next = {}
 
 function _M.warn(dict, name, code, msg, now, level)
+    local dict_key = dict or false
+    local bucket = worker_next[dict_key]
+    if not bucket then
+        bucket = {}
+        worker_next[dict_key] = bucket
+    end
+    local slot_key = name .. "\0" .. code
+    local until_t = bucket[slot_key]
+    if until_t and now < until_t then
+        return
+    end
+
     local key = "rb:" .. name .. ":log:" .. code
     local ok, err
     if dict then
+        if code == "dict_full" and dict.get and dict:get(key) ~= nil then
+            return
+        end
         ok, err = dict:add(key, "1", 1)
     else
         err = "no dict"
     end
 
-    if ok then
-        -- logged below
-    elseif err == "exists" then
+    if not ok and err == "exists" then
         return
-    else
-        local slot_key = name .. "\0" .. code
-        local until_t = worker_next[slot_key]
-        if until_t and now < until_t then
-            return
-        end
-        worker_next[slot_key] = now + 1
     end
+    bucket[slot_key] = now + 1
 
     local n = ngx
     if n and n.log then

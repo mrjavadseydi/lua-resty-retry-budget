@@ -276,7 +276,7 @@ function _M.new(name, opts)
     if ratio == nil then
         ratio = 0.2
     end
-    if type(ratio) ~= "number" or ratio < 0 or ratio > 10 then
+    if type(ratio) ~= "number" or not (ratio >= 0 and ratio <= 10) then
         return nil, "retry-budget: retry_ratio must be in [0, 10]"
     end
 
@@ -284,7 +284,7 @@ function _M.new(name, opts)
     if min_r == nil then
         min_r = 10
     end
-    if type(min_r) ~= "number" or min_r < 0 then
+    if type(min_r) ~= "number" or not (min_r >= 0 and min_r < math.huge) then
         return nil, "retry-budget: min_retries_per_sec must be >= 0"
     end
 
@@ -292,7 +292,7 @@ function _M.new(name, opts)
     if refresh == nil then
         refresh = 0.1
     end
-    if type(refresh) ~= "number" or refresh < 0 then
+    if type(refresh) ~= "number" or not (refresh >= 0 and refresh < math.huge) then
         return nil, "retry-budget: refresh_interval must be >= 0"
     end
 
@@ -545,9 +545,32 @@ local function stats_from_cfg(dict, zone, name, clock)
     return obj:stats()
 end
 
-function _M.stats_all()
-    local out = {}
+function _M.stats_all(extra_zones)
+    local scan = {}
     for zone, dict in pairs(zones) do
+        scan[zone] = dict
+    end
+    if extra_zones ~= nil then
+        local n = ngx
+        local shared = n and n.shared
+        if shared then
+            if type(extra_zones) == "string" then
+                if not scan[extra_zones] and shared[extra_zones] then
+                    scan[extra_zones] = shared[extra_zones]
+                end
+            elseif type(extra_zones) == "table" then
+                for i = 1, #extra_zones do
+                    local z = extra_zones[i]
+                    if type(z) == "string" and not scan[z] and shared[z] then
+                        scan[z] = shared[z]
+                    end
+                end
+            end
+        end
+    end
+
+    local out = {}
+    for zone, dict in pairs(scan) do
         local names = {}
         local blob = dict:get(NAMES_KEY) or ""
         for name in blob:gmatch("[^\n]+") do

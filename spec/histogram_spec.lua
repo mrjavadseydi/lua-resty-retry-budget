@@ -40,6 +40,7 @@ describe("histogram", function()
     end
 
     it("maps bucket edges", function()
+        assert.equal(1, histogram.bucket_of(0 / 0))
         assert.equal(1, histogram.bucket_of(0.2))
         assert.equal(1, histogram.bucket_of(1))
         assert.equal(2, histogram.bucket_of(histogram.RATIO))
@@ -84,9 +85,58 @@ describe("histogram", function()
         local p, err = est:percentile(95)
         assert.is_nil(p)
         assert.equal("not enough samples", err)
+        p, err = est:percentile(95, 5)
+        assert.is_nil(err)
+        assert.is_true(p > 10 and p < 20)
+        p, err = est:percentile(95, -1)
+        assert.is_nil(p)
+        assert.is_truthy(err:find("min_samples"))
         p, err = est:percentile(0)
         assert.is_nil(p)
         assert.is_truthy(err:find("out of range"))
+    end)
+
+    it("guards ngx.timer.at in restricted phases and retries after transient failure", function()
+        local box = env_at(10)
+        local est = estimator("timer_test", box)
+        local attempts = 0
+        local phase = "set"
+        _G.ngx = {
+            ERR = 3,
+            log = function() end,
+            get_phase = function()
+                return phase
+            end,
+            timer = {
+                at = function()
+                    attempts = attempts + 1
+                    if phase == "set" then
+                        error("API disabled in the context of set_by_lua*")
+                    end
+                    if attempts == 1 then
+                        return nil, "too many pending timers"
+                    end
+                    return true
+                end,
+            },
+        }
+        assert.is_true(est:record(12))
+        assert.equal(0, attempts)
+
+        phase = "content"
+        assert.is_true(est:record(12))
+        assert.equal(1, attempts)
+        assert.is_false(est._st.timer)
+
+        box.now = 11
+        assert.is_true(est:record(12))
+        assert.equal(1, attempts)
+
+        box.now = 16
+        assert.is_true(est:record(12))
+        assert.equal(2, attempts)
+        assert.is_true(est._st.timer)
+        _G.ngx = nil
     end)
 
     it("forgets samples that slide out of the window", function()

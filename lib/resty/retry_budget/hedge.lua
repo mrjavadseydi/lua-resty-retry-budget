@@ -3,27 +3,29 @@ local deadline = require "resty.retry_budget.deadline"
 local _M = {}
 
 local function resolve_delay(client, hedge)
-    local min_delay = hedge.min_delay_ms or 5
+    local min_delay = hedge.min_delay_ms
+    if min_delay == nil then
+        min_delay = 5
+    elseif type(min_delay) ~= "number"
+        or not (min_delay >= 0 and min_delay < math.huge) then
+        return nil, "bad_delay"
+    end
     local spec = hedge.delay
     if spec == nil then
         spec = "p95"
     end
     local ms, err
     if type(spec) == "number" then
+        if not (spec >= 0 and spec < math.huge) then
+            return nil, "bad_delay"
+        end
         ms = spec
     elseif type(spec) == "string" then
         local p = tonumber(spec:match("^p(%d+)$") or "")
         if not p or p < 1 or p > 100 then
             return nil, "bad_delay"
         end
-        local need = hedge.min_samples
-        if need == nil then
-            need = client.estimator._st.min_samples
-        end
-        if client.estimator:samples() < need then
-            return nil, "not_enough_samples"
-        end
-        ms, err = client.estimator:percentile(p)
+        ms, err = client.estimator:percentile(p, hedge.min_samples)
         if not ms then
             if err == "not enough samples" then
                 return nil, "not_enough_samples"
@@ -37,6 +39,28 @@ local function resolve_delay(client, hedge)
         ms = min_delay
     end
     return ms
+end
+
+local function choose_fallback(client, prev, cand, may_retry)
+    if not prev then
+        return cand
+    end
+    local prev_retry = client:should_retry(prev.res, prev.class)
+    local cand_retry = client:should_retry(cand.res, cand.class)
+    if may_retry and cand_retry ~= prev_retry then
+        return cand_retry and cand or prev
+    end
+    if (cand.res ~= nil) ~= (prev.res ~= nil) then
+        return cand.res ~= nil and cand or prev
+    end
+    if cand.res and prev.res and client.respect_retry_after then
+        local cand_ra = client.header(cand.res.headers, "Retry-After") ~= nil
+        local prev_ra = client.header(prev.res.headers, "Retry-After") ~= nil
+        if cand_ra and not prev_ra then
+            return cand
+        end
+    end
+    return prev
 end
 
 function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
@@ -146,9 +170,12 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
             sleep_ms = remain
             hit_deadline = true
         end
-        if hit_deadline and sleep_ms < 1 then
+        if hit_deadline and sleep_ms < 1 - 1e-3 then
             meta.deadline_exceeded = true
             return
+        end
+        if sleep_ms < 1 and hit_deadline then
+            sleep_ms = 1
         end
         timer = ngx.thread.spawn(function()
             local ok, err = pcall(ngx.sleep, sleep_ms / 1000)
@@ -172,12 +199,13 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
 
     local remain = deadline.remaining_ms(deadline_ms, start, client.clock())
     if remain then
-        if remain < 1 then
+        if remain < 1 - 1e-3 then
             meta.deadline_exceeded = true
             return nil, "deadline", meta
         end
+        local dsleep = remain < 1 and 1 or remain
         deadline_timer = ngx.thread.spawn(function()
-            ngx.sleep(remain / 1000)
+            ngx.sleep(dsleep / 1000)
             return { id = -1 }
         end)
     end
@@ -223,7 +251,15 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
         local sample_kind, class = pkt.sample_kind, pkt.class
 
         remain = deadline.remaining_ms(deadline_ms, start, client.clock())
-        if who == -1 or pkt.deadline or (remain and remain < 1) then
+        if who == -1 or pkt.deadline or (remain and remain <= 0) then
+            if type(who) == "number" and who >= 1 and slots[who] then
+                pending[who] = nil
+                slots[who].reaped = true
+                client:finish_socket(httpc, false, params)
+                if sample_kind == "response" or sample_kind == "timeout" then
+                    client.estimator:record(sample_ms)
+                end
+            end
             for _, slot in pairs(slots) do
                 cancel(slot, true)
             end
@@ -239,8 +275,7 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
 
         if who == 0 then
             timer = nil
-            local primary = slots[1]
-            if primary and not primary.reaped
+            if pending_n() > 0
                 and spawned < client.max_attempts and hedges < max_hedges then
                 if client.budget:try_acquire() then
                     hedges = hedges + 1
@@ -258,7 +293,6 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
             local slot = slots[who]
             pending[who] = nil
             slot.reaped = true
-            kill_timer()
             if sample_kind == "response" or sample_kind == "timeout" then
                 client.estimator:record(sample_ms)
             end
@@ -272,7 +306,7 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
                     end
                 end
                 stop_timers()
-                client:finish_socket(httpc, true)
+                client:finish_socket(httpc, true, params)
                 if slot.is_hedge then
                     client.budget:record_hedge_won()
                 end
@@ -282,18 +316,29 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
             end
 
             if class == "ok" then
-                client:finish_socket(httpc, true)
+                client:finish_socket(httpc, true, params)
             end
-            if not fallback then
-                fallback = { res = res, err = err, id = who, class = class }
-            end
+            local may_retry = spawned < client.max_attempts
+                and not meta.budget_exhausted
+                and not meta.deadline_exceeded
+            fallback = choose_fallback(client, fallback, {
+                res = res,
+                err = err,
+                id = who,
+                class = class,
+            }, may_retry)
             -- Attempt 1 finished before any hedge was sent: this is a retry,
-            -- not a hedge. The timer was killed above.
+            -- not a hedge.
             if who == 1 and hedges == 0 then
+                kill_timer()
                 break
             end
             if pending_n() == 0 then
+                kill_timer()
                 break
+            end
+            if hedges >= max_hedges or spawned >= client.max_attempts then
+                kill_timer()
             end
         else
             for _, slot in pairs(slots) do

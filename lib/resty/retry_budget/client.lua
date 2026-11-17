@@ -148,6 +148,55 @@ function _M.new(name, opts)
         return nil, "retry-budget: max_attempts must be an integer >= 1"
     end
 
+    local base_ms = bo.base_ms
+    if base_ms == nil then
+        base_ms = 25
+    end
+    if type(base_ms) ~= "number" or not (base_ms >= 0 and base_ms < math.huge) then
+        return nil, "retry-budget: backoff.base_ms must be >= 0"
+    end
+
+    local max_ms = bo.max_ms
+    if max_ms == nil then
+        max_ms = 1000
+    end
+    if type(max_ms) ~= "number" or not (max_ms >= 0 and max_ms < math.huge) then
+        return nil, "retry-budget: backoff.max_ms must be >= 0"
+    end
+
+    local connect_timeout = opts.connect_timeout
+    if connect_timeout == nil then
+        connect_timeout = 1000
+    end
+    if type(connect_timeout) ~= "number"
+        or not (connect_timeout >= 1 and connect_timeout < math.huge) then
+        return nil, "retry-budget: connect_timeout must be >= 1"
+    end
+
+    local send_timeout = opts.send_timeout
+    if send_timeout == nil then
+        send_timeout = 5000
+    end
+    if type(send_timeout) ~= "number"
+        or not (send_timeout >= 1 and send_timeout < math.huge) then
+        return nil, "retry-budget: send_timeout must be >= 1"
+    end
+
+    local read_timeout = opts.read_timeout
+    if read_timeout == nil then
+        read_timeout = 5000
+    end
+    if type(read_timeout) ~= "number"
+        or not (read_timeout >= 1 and read_timeout < math.huge) then
+        return nil, "retry-budget: read_timeout must be >= 1"
+    end
+
+    local deadline_ms = opts.deadline_ms
+    if deadline_ms ~= nil and (type(deadline_ms) ~= "number"
+        or not (deadline_ms >= 0 and deadline_ms < math.huge)) then
+        return nil, "retry-budget: deadline_ms must be >= 0"
+    end
+
     return setmetatable({
         name = name,
         budget = budget,
@@ -157,12 +206,12 @@ function _M.new(name, opts)
         http = http,
         http_headers = http_headers,
         max_attempts = max_attempts,
-        base_ms = bo.base_ms or 25,
-        max_ms = bo.max_ms or 1000,
-        connect_timeout = opts.connect_timeout or 1000,
-        send_timeout = opts.send_timeout or 5000,
-        read_timeout = opts.read_timeout or 5000,
-        deadline_ms = opts.deadline_ms,
+        base_ms = base_ms,
+        max_ms = max_ms,
+        connect_timeout = connect_timeout,
+        send_timeout = send_timeout,
+        read_timeout = read_timeout,
+        deadline_ms = deadline_ms,
         keepalive_timeout = opts.keepalive_timeout,
         keepalive_pool = opts.keepalive_pool,
         respect_retry_after = opts.respect_retry_after ~= false,
@@ -404,16 +453,17 @@ local function read_headers(clock, deadline_ms, start, sock, read_timeout, http_
         if line == "" then
             return headers, nil, capped
         end
-        local key, val = line:match("^([^:%s]+):[ \t]*(.*)$")
-        if key then
-            local prev = headers[key]
-            if prev == nil then
-                headers[key] = val
-            elseif type(prev) == "table" then
-                prev[#prev + 1] = val
-            else
-                headers[key] = { prev, val }
-            end
+        local key, val = line:match("^([!#$%%&'*+%.%^_`|~%w%-]+):[ \t]*(.-)[ \t]*$")
+        if not key then
+            return nil, "malformed header line", capped
+        end
+        local prev = headers[key]
+        if prev == nil then
+            headers[key] = val
+        elseif type(prev) == "table" then
+            prev[#prev + 1] = val
+        else
+            headers[key] = { prev, val }
         end
     end
 end
@@ -550,15 +600,18 @@ local function send_body(self, sock, body, deadline_ms, start)
     end
 end
 
-function _M.finish_socket(self, httpc, keep)
+function _M.finish_socket(self, httpc, keep, params)
     if not httpc then
         return
     end
-    if not keep or httpc.keepalive == false then
+    if not keep or httpc.keepalive == false
+        or (params and params.keepalive == false) then
         close_httpc(httpc)
         return
     end
-    local ok, err = httpc:set_keepalive(self.keepalive_timeout, self.keepalive_pool)
+    local timeout = (params and params.keepalive_timeout) or self.keepalive_timeout
+    local pool = (params and params.keepalive_pool) or self.keepalive_pool
+    local ok, err = httpc:set_keepalive(timeout, pool)
     if not ok and err ~= "closed" then
         close_httpc(httpc)
     end
@@ -615,8 +668,13 @@ function _M.attempt(self, uri, params, deadline_ms, slot, request_start)
         port = port,
         ssl_server_name = params.ssl_server_name or host,
         ssl_verify = params.ssl_verify,
+        ssl_client_cert = params.ssl_client_cert,
+        ssl_client_priv_key = params.ssl_client_priv_key,
+        ssl_session_reuse = params.ssl_session_reuse,
         pool = params.pool,
         pool_size = params.pool_size,
+        backlog = params.backlog,
+        proxy_opts = params.proxy_opts,
     })
     if not ok then
         local class = class_of("connect", err, capped)
@@ -634,11 +692,22 @@ function _M.attempt(self, uri, params, deadline_ms, slot, request_start)
         return nil, aerr, nil, elapsed, "timeout", "deadline"
     end
 
+    local req_headers = copy_map(params.headers)
+    local expect = _M.header(req_headers, "Expect")
+    local body_pending = false
+    if expect and expect:lower():match("^[ \t]*(.-)[ \t]*$") == "100-continue" then
+        for k in pairs(req_headers) do
+            if type(k) == "string" and k:lower() == "expect" then
+                req_headers[k] = "100-continue"
+            end
+        end
+        body_pending = params.body ~= nil
+    end
     local req = {
         method = params.method,
         path = path,
         query = query,
-        headers = copy_map(params.headers),
+        headers = req_headers,
         body = params.body,
         version = params.version,
     }
@@ -650,7 +719,6 @@ function _M.attempt(self, uri, params, deadline_ms, slot, request_start)
         close_httpc(httpc)
         return nil, err, nil, elapsed, kind, class
     end
-    local body_pending = _M.header(req.headers, "Expect") == "100-continue"
 
     local version, status, reason, headers
     local interim = 0
@@ -665,13 +733,19 @@ function _M.attempt(self, uri, params, deadline_ms, slot, request_start)
             close_httpc(httpc)
             return nil, lerr, nil, elapsed, kind, class
         end
-        version = tonumber(line:sub(6, 8))
-        status = tonumber(line:sub(10, 12))
-        if not version or not status then
+        local maj, min_v, code_s, rest =
+            line:match("^HTTP/(%d+)%.(%d+) (%d%d%d)(.*)$")
+        if not maj or (rest ~= "" and rest:byte(1) ~= 32 and rest:byte(1) ~= 9) then
             close_httpc(httpc)
             return nil, "bad status line", nil, nil, nil, "transport"
         end
-        reason = line:sub(14)
+        version = tonumber(maj .. "." .. min_v)
+        status = tonumber(code_s)
+        if not version or not status or status < 100 then
+            close_httpc(httpc)
+            return nil, "bad status line", nil, nil, nil, "transport"
+        end
+        reason = rest ~= "" and rest:sub(2) or ""
         local herr, hcapped
         headers, herr, hcapped = read_headers(self.clock, deadline_ms, origin,
             sock, self.read_timeout, self.http_headers)
@@ -695,7 +769,7 @@ function _M.attempt(self, uri, params, deadline_ms, slot, request_start)
         end
         -- 100, 102, and 103 are followed by a final response on this
         -- socket. 101 is final: the connection is no longer HTTP.
-        if status < 100 or status >= 200 or status == 101 then
+        if status >= 200 or status == 101 then
             break
         end
         interim = interim + 1
@@ -705,7 +779,7 @@ function _M.attempt(self, uri, params, deadline_ms, slot, request_start)
         end
     end
     apply_keepalive(httpc, version, headers)
-    if status == 101 then
+    if status == 101 or body_pending then
         httpc.keepalive = false
     end
 
@@ -732,41 +806,76 @@ local function attempt_with_deadline(self, uri, params, deadline_ms, start)
     if deadline_ms == nil then
         return self:attempt(uri, params, nil, nil, start)
     end
+    local remain = deadline.remaining_ms(deadline_ms, start, self.clock())
+    if remain < 1 - 1e-3 then
+        return nil, "deadline", nil, nil, nil, "deadline"
+    end
 
     local slot = {}
     local attempt = ngx.thread.spawn(function()
-        return { self:attempt(uri, params, deadline_ms, slot, start) }
+        local res, err, httpc, sample_ms, sample_kind, class =
+            self:attempt(uri, params, deadline_ms, slot, start)
+        slot.done = true
+        slot.res = res
+        slot.err = err
+        slot.out_httpc = httpc
+        slot.sample_ms = sample_ms
+        slot.sample_kind = sample_kind
+        slot.class = class
+        return false
     end)
-    local remain = deadline.remaining_ms(deadline_ms, start, self.clock())
-    local timer
-    if remain >= 1 then
-        timer = ngx.thread.spawn(function()
-            ngx.sleep(remain / 1000)
-            return true
-        end)
-    end
-    local ok, result
-    if timer then
-        ok, result = ngx.thread.wait(attempt, timer)
-        ngx.thread.kill(timer)
+
+    local ok = true
+    local err_msg
+    local timed_out = false
+    if not slot.done then
         remain = deadline.remaining_ms(deadline_ms, start, self.clock())
-    end
-    if not timer or result == true or remain < 1 then
-        -- Kill the reader before close(), which otherwise reports busy.
-        ngx.thread.kill(attempt)
-        close_httpc(slot.httpc)
-        local elapsed, kind
-        if slot.io_started then
-            elapsed = (self.clock() - slot.started) * 1000
-            kind = "timeout"
+        if remain >= 1 - 1e-3 then
+            local sleep_s = (remain < 1 and 1 or remain) / 1000
+            local timer = ngx.thread.spawn(function()
+                ngx.sleep(sleep_s)
+                return true
+            end)
+            local wok, wres = ngx.thread.wait(attempt, timer)
+            ngx.thread.kill(timer)
+            if not wok then
+                ok = false
+                err_msg = wres
+            elseif wres == true then
+                timed_out = true
+            end
+        else
+            timed_out = true
         end
-        return nil, "deadline", nil, elapsed, kind, "deadline"
     end
+
     if not ok then
         close_httpc(slot.httpc)
-        return nil, result, nil, nil, nil, "error"
+        return nil, err_msg, nil, nil, nil, "error"
     end
-    return unpack(result, 1, 6)
+
+    remain = deadline.remaining_ms(deadline_ms, start, self.clock())
+    if timed_out or not slot.done or remain <= 0 then
+        if not slot.done then
+            -- Kill the reader before close(), which otherwise reports busy.
+            ngx.thread.kill(attempt)
+            close_httpc(slot.httpc)
+            local elapsed, kind
+            if slot.io_started then
+                elapsed = (self.clock() - slot.started) * 1000
+                kind = "timeout"
+            end
+            return nil, "deadline", nil, elapsed, kind, "deadline"
+        end
+        close_httpc(slot.out_httpc or slot.httpc)
+        local kind = slot.sample_kind
+        if kind == "response" then
+            kind = "timeout"
+        end
+        return nil, "deadline", nil, slot.sample_ms, kind, "deadline"
+    end
+    return slot.res, slot.err, slot.out_httpc, slot.sample_ms,
+           slot.sample_kind, slot.class
 end
 
 function _M.sequential(self, uri, params, meta, already, last_res, last_err,
@@ -776,6 +885,7 @@ function _M.sequential(self, uri, params, meta, already, last_res, last_err,
         max_attempts = 1
     end
     local res, err, class = last_res, last_err, last_class
+    local prev_winner = meta.winner
     local attempt = already
     while attempt < max_attempts do
         if attempt >= 1 then
@@ -800,26 +910,34 @@ function _M.sequential(self, uri, params, meta, already, last_res, last_err,
                 ngx.sleep(delay / 1000)
             end
             remain = deadline.remaining_ms(deadline_ms, start, self.clock())
-            if remain and remain < 1 then
+            if remain and remain < 1 - 1e-3 then
                 meta.deadline_exceeded = true
                 break
             end
         end
 
+        local prev_res, prev_err = res, err
         attempt = attempt + 1
         meta.attempts = attempt
         local httpc, sample_ms, sample_kind
         res, err, httpc, sample_ms, sample_kind, class =
             attempt_with_deadline(self, uri, params, deadline_ms, start)
-        meta.winner = attempt
         self:record_sample(sample_kind, sample_ms)
         if class == "ok" then
-            self:finish_socket(httpc, true)
+            self:finish_socket(httpc, true, params)
         end
         if class == "deadline" then
             meta.deadline_exceeded = true
+            if attempt > 1 and (prev_res ~= nil or prev_err ~= nil) then
+                res, err = prev_res, prev_err
+                meta.winner = prev_winner
+            else
+                meta.winner = attempt
+            end
             break
         end
+        meta.winner = attempt
+        prev_winner = attempt
     end
     return res, err, meta
 end
@@ -846,6 +964,9 @@ function _M.request_uri(self, uri, params, call_opts)
     local deadline_ms = call_opts.deadline_ms
     if deadline_ms == nil then
         deadline_ms = self.deadline_ms
+    elseif type(deadline_ms) ~= "number"
+        or not (deadline_ms >= 0 and deadline_ms < math.huge) then
+        return nil, "retry-budget: deadline_ms must be >= 0", meta
     end
     local start = self.clock()
     self.budget:record_request()

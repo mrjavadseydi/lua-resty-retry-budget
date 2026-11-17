@@ -102,4 +102,25 @@ describe("client policy", function()
         assert.is_true(c:response_wins(res, nil, false))
         assert.is_true(c:response_wins({ status = 200, headers = {} }, nil, true))
     end)
+
+    it("validates numeric timeout, backoff, and deadline options", function()
+        local dict = fake.new(function() return 10 end)
+        local bad = {
+            { connect_timeout = 0 },
+            { send_timeout = -5 },
+            { read_timeout = 0 / 0 },
+            { deadline_ms = -1 },
+            { deadline_ms = 0 / 0 },
+            { backoff = { base_ms = -1 } },
+            { backoff = { max_ms = math.huge } },
+        }
+        for i = 1, #bad do
+            local opts = bad[i]
+            opts.dict = "retry_budget"
+            opts.dict_obj = dict
+            local inst, err = client.new("bad" .. i, opts)
+            assert.is_nil(inst)
+            assert.is_truthy(err)
+        end
+    end)
 end)
