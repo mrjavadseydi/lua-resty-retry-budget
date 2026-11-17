@@ -31,13 +31,10 @@ function _M.run()
         mark("budget_attempt_other")
     end
 
-    local may_arm = n < MAX_ATTEMPTS
     if n == 1 then
         budget:record_request()
-    elseif not budget:try_acquire() then
+    else
         budget:record_retry()
-        may_arm = false
-        mark("budget_acquire_denied")
     end
 
     local ok, err = balancer.set_current_peer("127.0.0.1", 1986)
@@ -46,7 +43,7 @@ function _M.run()
         return
     end
 
-    if may_arm and budget:can_acquire() then
+    if n < MAX_ATTEMPTS and budget:can_acquire() then
         ok, err = balancer.set_more_tries(1)
         if not ok then
             ngx.log(ngx.ERR, "[retry-budget] key=payments ", err)

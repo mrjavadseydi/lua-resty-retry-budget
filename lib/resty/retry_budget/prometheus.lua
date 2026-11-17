@@ -3,10 +3,17 @@
 -- observe() in the scrape location before collect(). The numbers are
 -- sliding-window gauges, not lifetime counters.
 
+local pairs = pairs
+local pcall = pcall
+local require = require
+local type = type
+local loaded = package.loaded
+
 local _M = {}
 
 local gauges
 local watch_zones
+local rb_mod
 
 local function ensure_prom(prom)
     if type(prom) == "table" and prom.gauge then
@@ -39,6 +46,9 @@ function _M.register(prom, opts)
         retries = inst:gauge("retry_budget_retries_window",
             "Retries and hedges withdrawn in the current window",
             { "budget", "dict" }),
+        allowance = inst:gauge("retry_budget_allowance_window",
+            "Allowed retries in the current window",
+            { "budget", "dict" }),
         rejected = inst:gauge("retry_budget_retries_rejected_window",
             "Retries refused by the budget in the current window",
             { "budget", "dict" }),
@@ -67,7 +77,11 @@ function _M.observe()
     if not gauges then
         return nil, "retry-budget: prometheus.register was not called"
     end
-    local rb = require "resty.retry_budget"
+    local rb = rb_mod or loaded["resty.retry_budget"]
+    if not rb then
+        rb = require "resty.retry_budget"
+        rb_mod = rb
+    end
     local all = rb.stats(watch_zones)
     -- NaN clears a percentile whose samples have left the window.
     -- A number that is only omitted would keep the previous scrape.
@@ -77,6 +91,7 @@ function _M.observe()
             local label = { name, zone }
             gauges.requests:set(st.requests or 0, label)
             gauges.retries:set(st.retries or 0, label)
+            gauges.allowance:set(st.allowance or 0, label)
             gauges.rejected:set(st.rejected or 0, label)
             gauges.hedges_sent:set(st.hedges_sent or 0, label)
             gauges.hedges_won:set(st.hedges_won or 0, label)

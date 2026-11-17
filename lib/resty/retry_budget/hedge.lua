@@ -1,5 +1,14 @@
 local deadline = require "resty.retry_budget.deadline"
 
+local huge = math.huge
+local match = string.match
+local pairs = pairs
+local pcall = pcall
+local tonumber = tonumber
+local tostring = tostring
+local type = type
+local unpack = unpack
+
 local _M = {}
 
 local function resolve_delay(client, hedge)
@@ -7,7 +16,7 @@ local function resolve_delay(client, hedge)
     if min_delay == nil then
         min_delay = 5
     elseif type(min_delay) ~= "number"
-        or not (min_delay >= 0 and min_delay < math.huge) then
+        or not (min_delay >= 0 and min_delay < huge) then
         return nil, "bad_delay"
     end
     local spec = hedge.delay
@@ -16,12 +25,12 @@ local function resolve_delay(client, hedge)
     end
     local ms, err
     if type(spec) == "number" then
-        if not (spec >= 0 and spec < math.huge) then
+        if not (spec >= 0 and spec < huge) then
             return nil, "bad_delay"
         end
         ms = spec
     elseif type(spec) == "string" then
-        local p = tonumber(spec:match("^p(%d+)$") or "")
+        local p = tonumber(match(spec, "^p(%d+)$") or "")
         if not p or p < 1 or p > 100 then
             return nil, "bad_delay"
         end
@@ -63,12 +72,12 @@ local function choose_fallback(client, prev, cand, may_retry)
     return prev
 end
 
-function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
+function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start, call_ctx)
     local delay_ms, derr = resolve_delay(client, hedge_opt)
     if not delay_ms then
         meta.hedge_skipped = derr
         return client:sequential(uri, params, meta, 0, nil, nil, nil,
-                                 deadline_ms, start)
+                                 deadline_ms, start, call_ctx)
     end
 
     local max_hedges = hedge_opt.max_hedges or 1
@@ -79,6 +88,7 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
 
     local slots = {}
     local pending = {}
+    local pending_count = 0
     local spawned = 0
     local hedges = 0
     local timer
@@ -100,7 +110,7 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
         slot.thread = ngx.thread.spawn(function()
             local ok, res, err, httpc, sample_ms, sample_kind, class =
                 pcall(client.attempt, client, uri, params, deadline_ms, slot,
-                      start)
+                      start, call_ctx)
             if not ok then
                 if slot.httpc then
                     slot.httpc.keepalive = false
@@ -119,6 +129,7 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
             }
         end)
         pending[id] = slot.thread
+        pending_count = pending_count + 1
         return slot
     end
 
@@ -142,7 +153,10 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
         if slot.httpc then
             slot.httpc:close()
         end
-        pending[slot.id] = nil
+        if pending[slot.id] then
+            pending[slot.id] = nil
+            pending_count = pending_count - 1
+        end
         slot.reaped = true
     end
 
@@ -189,14 +203,6 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
         end)
     end
 
-    local function pending_n()
-        local n = 0
-        for _ in pairs(pending) do
-            n = n + 1
-        end
-        return n
-    end
-
     local remain = deadline.remaining_ms(deadline_ms, start, client.clock())
     if remain then
         if remain < 1 - 1e-3 then
@@ -213,8 +219,11 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
     spawn_attempt(false)
     arm_timer(delay_ms)
 
+    local list = {}
+    local prev_n = 0
+    local wait = ngx.thread.wait
+
     while true do
-        local list = {}
         local n = 0
         for _, th in pairs(pending) do
             n = n + 1
@@ -228,11 +237,26 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
             n = n + 1
             list[n] = deadline_timer
         end
+        for i = n + 1, prev_n do
+            list[i] = nil
+        end
+        prev_n = n
         if n == 0 then
             break
         end
 
-        local first, second = ngx.thread.wait(unpack(list))
+        local first, second
+        if n == 1 then
+            first, second = wait(list[1])
+        elseif n == 2 then
+            first, second = wait(list[1], list[2])
+        elseif n == 3 then
+            first, second = wait(list[1], list[2], list[3])
+        elseif n == 4 then
+            first, second = wait(list[1], list[2], list[3], list[4])
+        else
+            first, second = wait(unpack(list, 1, n))
+        end
         local pkt = first
         if type(pkt) ~= "table" and type(second) == "table" then
             pkt = second
@@ -253,7 +277,10 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
         remain = deadline.remaining_ms(deadline_ms, start, client.clock())
         if who == -1 or pkt.deadline or (remain and remain <= 0) then
             if type(who) == "number" and who >= 1 and slots[who] then
-                pending[who] = nil
+                if pending[who] then
+                    pending[who] = nil
+                    pending_count = pending_count - 1
+                end
                 slots[who].reaped = true
                 client:finish_socket(httpc, false, params)
                 if sample_kind == "response" or sample_kind == "timeout" then
@@ -275,7 +302,7 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
 
         if who == 0 then
             timer = nil
-            if pending_n() > 0
+            if pending_count > 0
                 and spawned < client.max_attempts and hedges < max_hedges then
                 if client.budget:try_acquire() then
                     hedges = hedges + 1
@@ -291,7 +318,10 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
             end
         elseif type(who) == "number" then
             local slot = slots[who]
-            pending[who] = nil
+            if pending[who] then
+                pending[who] = nil
+                pending_count = pending_count - 1
+            end
             slot.reaped = true
             if sample_kind == "response" or sample_kind == "timeout" then
                 client.estimator:record(sample_ms)
@@ -333,7 +363,7 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
                 kill_timer()
                 break
             end
-            if pending_n() == 0 then
+            if pending_count == 0 then
                 kill_timer()
                 break
             end
@@ -360,7 +390,7 @@ function _M.run(client, uri, params, hedge_opt, meta, deadline_ms, start)
         meta.winner = winner
     end
     return client:sequential(uri, params, meta, spawned, last_res, last_err,
-                             last_class, deadline_ms, start)
+                             last_class, deadline_ms, start, call_ctx)
 end
 
 return _M

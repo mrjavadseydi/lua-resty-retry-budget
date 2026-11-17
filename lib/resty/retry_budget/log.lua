@@ -2,6 +2,8 @@
 -- Dict add is the cluster-wide limiter. If the dict cannot record the
 -- limiter key, a worker-local timestamp is the fallback.
 
+local pairs = pairs
+
 local _M = {}
 
 local worker_next = {}

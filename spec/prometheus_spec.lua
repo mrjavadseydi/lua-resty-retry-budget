@@ -111,6 +111,7 @@ describe("prometheus", function()
         assert.equal("retry_budget", requests.labels[2])
         assert.equal(1, requests.value)
         assert.equal(1, sample("retry_budget_retries_window").value)
+        assert.near(0.2, sample("retry_budget_allowance_window").value, 1e-6)
         assert.equal(0, sample("retry_budget_retries_rejected_window").value)
 
         local p50 = sample("retry_budget_latency_ms", "0.5")

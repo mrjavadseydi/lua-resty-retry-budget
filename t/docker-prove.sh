@@ -4,7 +4,7 @@ set -eu
 ROOT=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
 IMAGE=${OPENRESTY_IMAGE:-openresty/openresty:1.31.1.1-3-jammy}
 
-docker run --rm \
+docker run --rm --init --ulimit nofile=65536:65536 \
     -v "$ROOT":/src \
     -w /src \
     "$IMAGE" \

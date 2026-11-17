@@ -8,7 +8,7 @@ DURATION=${DURATION:-15}
 THREADS=${THREADS:-2}
 CONNS=${CONNS:-64}
 
-docker run --rm \
+docker run --rm --init --ulimit nofile=65536:65536 \
     -v "$ROOT":/src \
     -w /src \
     -e WARMUP="$WARMUP" \

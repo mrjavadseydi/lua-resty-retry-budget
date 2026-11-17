@@ -320,4 +320,30 @@ describe("budget", function()
         local all = budget.stats_all({ "retry_budget" })
         assert.equal(1, all.retry_budget.payments.requests)
     end)
+
+    it("does zero dict gets on write-only calls and reads only q/t on acquire", function()
+        local env = box(20.5)
+        local b = new_budget("fastpath", env, { window_sec = 10 })
+        local gets = 0
+        local orig_get = env.dict.get
+        env.dict.get = function(d, k)
+            gets = gets + 1
+            return orig_get(d, k)
+        end
+
+        assert.is_true(b:record_request())
+        assert.is_true(b:record_retry())
+        assert.is_true(b:record_hedge_sent())
+        assert.is_true(b:record_hedge_won())
+        assert.equal(0, gets)
+
+        -- First acquire sums 9 closed seconds * 2 kinds + 2 current = 20 gets (not 60).
+        assert.is_true(b:try_acquire())
+        assert.equal(20, gets)
+
+        -- Warm acquire inside refresh_interval reads only current q and t = 2 gets (not 6).
+        gets = 0
+        assert.is_true(b:can_acquire())
+        assert.equal(2, gets)
+    end)
 end)

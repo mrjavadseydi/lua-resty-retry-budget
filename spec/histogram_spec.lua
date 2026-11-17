@@ -96,11 +96,12 @@ describe("histogram", function()
         assert.is_truthy(err:find("out of range"))
     end)
 
-    it("guards ngx.timer.at in restricted phases and retries after transient failure", function()
+    it("arms refresh timers lazily, guards phases, retries, and parks when idle", function()
         local box = env_at(10)
-        local est = estimator("timer_test", box)
+        local est = estimator("timer_test", box, { window_sec = 20, slot_sec = 10 })
         local attempts = 0
-        local phase = "set"
+        local last_cb
+        local phase = "content"
         _G.ngx = {
             ERR = 3,
             log = function() end,
@@ -108,8 +109,9 @@ describe("histogram", function()
                 return phase
             end,
             timer = {
-                at = function()
+                at = function(_, cb)
                     attempts = attempts + 1
+                    last_cb = cb
                     if phase == "set" then
                         error("API disabled in the context of set_by_lua*")
                     end
@@ -120,23 +122,59 @@ describe("histogram", function()
                 end,
             },
         }
+        -- record() alone does not start a background refresh timer.
         assert.is_true(est:record(12))
         assert.equal(0, attempts)
 
+        phase = "set"
+        assert.is_true(est:percentile(50) > 10)
+        assert.equal(0, attempts)
+
         phase = "content"
-        assert.is_true(est:record(12))
+        assert.is_true(est:percentile(50) > 10)
         assert.equal(1, attempts)
         assert.is_false(est._st.timer)
 
         box.now = 11
-        assert.is_true(est:record(12))
+        assert.is_true(est:percentile(50) > 10)
         assert.equal(1, attempts)
 
         box.now = 16
-        assert.is_true(est:record(12))
+        assert.is_true(est:percentile(50) > 10)
         assert.equal(2, attempts)
         assert.is_true(est._st.timer)
+
+        -- Idle past window_sec stops rescheduling the timer.
+        box.now = 40
+        last_cb(false)
+        assert.is_false(est._st.timer)
+        assert.equal(2, attempts)
         _G.ngx = nil
+    end)
+
+    it("caches closed slots so intra-slot refreshes only read the active slot", function()
+        local box = env_at(22)
+        local gets = 0
+        local orig_get = box.dict.get
+        box.dict.get = function(d, k)
+            gets = gets + 1
+            return orig_get(d, k)
+        end
+        local est = estimator("slot_cache", box, { window_sec = 60, slot_sec = 10 })
+        gets = 0
+        assert.is_true(est:record(15))
+        assert.equal(0, gets)
+
+        -- First scan sums 6 slots * 128 = 768 keys.
+        assert.is_true(est:percentile(95) > 10)
+        assert.equal(6 * histogram.BUCKETS, gets)
+
+        -- 2 seconds later inside the same 10s slot (and >1s into slot 2):
+        -- prev_settled is true, so only the 128 active-slot keys are read.
+        gets = 0
+        box.now = 24
+        assert.is_true(est:percentile(95) > 10)
+        assert.equal(histogram.BUCKETS, gets)
     end)
 
     it("forgets samples that slide out of the window", function()

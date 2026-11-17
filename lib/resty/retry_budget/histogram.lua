@@ -1,13 +1,31 @@
 local log = require "resty.retry_budget.log"
 
+local ceil = math.ceil
+local floor = math.floor
+local huge = math.huge
+local mlog = math.log
+local pairs = pairs
+local pcall = pcall
+local require = require
+local setmetatable = setmetatable
+local tonumber = tonumber
+local tostring = tostring
+local type = type
+local loaded = package.loaded
+
 local _M = {}
 
-local LN = math.log(2) / 8
+local LN = mlog(2) / 8
 local MIN_MS = 1
 local MAX_MS = 60000
 local RATIO = 2 ^ (1 / 8)
-local N_FINITE = math.ceil(math.log(MAX_MS / MIN_MS) / LN)
+local N_FINITE = ceil(mlog(MAX_MS / MIN_MS) / LN)
 local N = N_FINITE + 1
+
+local LOWER = {}
+for k = 1, N do
+    LOWER[k] = MIN_MS * (RATIO ^ (k - 1))
+end
 
 _M.BUCKETS = N
 _M.MIN_MS = MIN_MS
@@ -20,8 +38,8 @@ function _M.bucket_of(ms)
     if type(ms) ~= "number" or ms ~= ms or ms < MIN_MS then
         return 1
     end
-    local x = math.log(ms / MIN_MS) / LN
-    local k = math.floor(x + 1e-10) + 1
+    local x = mlog(ms / MIN_MS) / LN
+    local k = floor(x + 1e-10) + 1
     if k < 1 then
         return 1
     end
@@ -29,10 +47,6 @@ function _M.bucket_of(ms)
         return N
     end
     return k
-end
-
-local function lower_of(k)
-    return MIN_MS * (RATIO ^ (k - 1))
 end
 
 local registry = {}
@@ -55,17 +69,29 @@ local function state_for(zone, name)
     local key = reg_key(zone, name)
     local st = registry[key]
     if not st then
+        local closed_counts = {}
+        local prev_counts = {}
+        for i = 1, N do
+            closed_counts[i] = 0
+            prev_counts[i] = 0
+        end
         st = {
             zone = zone,
             name = name,
             keys = {},
+            prev_keys = {},
             slot = nil,
+            closed_slot = nil,
+            prev_settled = true,
+            closed_counts = closed_counts,
+            prev_counts = prev_counts,
             counts = {},
             total = 0,
-            refreshed_at = -math.huge,
+            refreshed_at = -huge,
+            last_query_at = -huge,
             timer = false,
-            timer_failed = false,
             have_counts = false,
+            hcfg = nil,
         }
         registry[key] = st
     end
@@ -88,24 +114,64 @@ local function refresh(st, now)
     if st.have_counts and (now - st.refreshed_at) < 1 then
         return true
     end
-    local slot = math.floor(now / st.slot_sec)
-    local nslots = math.floor(st.window_sec / st.slot_sec)
-    local counts = st.counts
-    for i = 1, N do
-        counts[i] = 0
-    end
-    local total = 0
-    local from = slot - nslots + 1
+    local slot = floor(now / st.slot_sec)
+    ensure_keys(st, slot)
+    local nslots = floor(st.window_sec / st.slot_sec)
+    local closed = st.closed_counts
+    local prev = st.prev_counts
+    local prev_keys = st.prev_keys
     local dict = st.dict
-    for s = from, slot do
-        local base = st.prefix .. s .. ":"
+
+    if st.closed_slot ~= slot then
         for i = 1, N do
-            local v = dict:get(base .. i)
-            if type(v) == "number" then
-                counts[i] = counts[i] + v
-                total = total + v
+            closed[i] = 0
+            prev[i] = 0
+        end
+        local from = slot - nslots + 1
+        local to = slot - 1
+        for s = from, to do
+            local base = st.prefix .. s .. ":"
+            if s == to then
+                for i = 1, N do
+                    local k = base .. i
+                    prev_keys[i] = k
+                    local v = dict:get(k)
+                    if type(v) == "number" then
+                        prev[i] = v
+                        closed[i] = closed[i] + v
+                    end
+                end
+            else
+                for i = 1, N do
+                    local v = dict:get(base .. i)
+                    if type(v) == "number" then
+                        closed[i] = closed[i] + v
+                    end
+                end
             end
         end
+        st.closed_slot = slot
+        st.prev_settled = (nslots < 2) or ((now - slot * st.slot_sec) >= 1)
+    elseif not st.prev_settled then
+        for i = 1, N do
+            local v = dict:get(prev_keys[i])
+            local nv = type(v) == "number" and v or 0
+            closed[i] = closed[i] - prev[i] + nv
+            prev[i] = nv
+        end
+        if (now - slot * st.slot_sec) >= 1 then
+            st.prev_settled = true
+        end
+    end
+
+    local keys = st.keys
+    local counts = st.counts
+    local total = 0
+    for i = 1, N do
+        local v = dict:get(keys[i])
+        local c = closed[i] + (type(v) == "number" and v or 0)
+        counts[i] = c
+        total = total + c
     end
     st.total = total
     st.refreshed_at = now
@@ -137,6 +203,10 @@ local function ensure_timer(st)
             return
         end
         local now = st.clock()
+        if (now - st.last_query_at) > st.window_sec then
+            st.timer = false
+            return
+        end
         refresh(st, now)
         st.timer = false
         ensure_timer(st)
@@ -164,7 +234,7 @@ local function quantile(st, p, min_samples)
     if st.total == 0 or st.total < need then
         return nil, "not enough samples"
     end
-    local target = math.ceil(p / 100 * st.total)
+    local target = ceil(p / 100 * st.total)
     local cum = 0
     for k = 1, N do
         local c = st.counts[k]
@@ -175,8 +245,7 @@ local function quantile(st, p, min_samples)
             elseif frac > 1 then
                 frac = 1
             end
-            local lower = lower_of(k)
-            return lower * (RATIO ^ frac)
+            return LOWER[k] * (RATIO ^ frac)
         end
         cum = cum + c
     end
@@ -194,11 +263,11 @@ function _M.new(name, opts)
 
     local window = opts.window_sec or 60
     local slot = opts.slot_sec or 10
-    if type(window) ~= "number" or window ~= math.floor(window)
+    if type(window) ~= "number" or window ~= floor(window)
         or window < 1 or window > 3600 then
         return nil, "retry-budget: histogram window_sec must be an integer in 1..3600"
     end
-    if type(slot) ~= "number" or slot ~= math.floor(slot) or slot < 1
+    if type(slot) ~= "number" or slot ~= floor(slot) or slot < 1
         or window % slot ~= 0 then
         return nil, "retry-budget: slot_sec must divide window_sec"
     end
@@ -208,7 +277,7 @@ function _M.new(name, opts)
         min_samples = 100
     end
     if type(min_samples) ~= "number" or min_samples < 0
-        or min_samples ~= math.floor(min_samples) then
+        or min_samples ~= floor(min_samples) then
         return nil, "retry-budget: min_samples must be an integer >= 0"
     end
 
@@ -218,9 +287,11 @@ function _M.new(name, opts)
         if type(zone) ~= "string" or zone == "" then
             return nil, "retry-budget: dict name required"
         end
-        local core_ok, core_err = pcall(require, "resty.core.shdict")
-        if not core_ok then
-            return nil, "retry-budget: resty.core.shdict required: " .. core_err
+        if not loaded["resty.core.shdict"] then
+            local core_ok, core_err = pcall(require, "resty.core.shdict")
+            if not core_ok then
+                return nil, "retry-budget: resty.core.shdict required: " .. core_err
+            end
         end
         local shared = ngx.shared
         dict = shared and shared[zone]
@@ -236,6 +307,9 @@ function _M.new(name, opts)
     local st = state_for(zone, name)
     local window_changed = st.window_sec ~= window or st.slot_sec ~= slot
         or st.dict ~= dict
+    if st.dict ~= dict then
+        st.hcfg = nil
+    end
     st.dict = dict
     st.clock = opts.clock or default_clock
     st.window_sec = window
@@ -245,13 +319,21 @@ function _M.new(name, opts)
     st.prefix = "rb:" .. name .. ":L:"
     if window_changed then
         st.have_counts = false
-        st.refreshed_at = -math.huge
+        st.refreshed_at = -huge
         st.slot = nil
+        st.closed_slot = nil
+        st.prev_settled = true
     end
 
-    local budget = require "resty.retry_budget.budget"
+    local budget = loaded["resty.retry_budget.budget"]
+        or require "resty.retry_budget.budget"
     budget.register_name(dict, zone, name)
-    dict:set("rb:" .. name .. ":hcfg", window .. "," .. slot .. "," .. min_samples)
+    local hcfg_str = window .. "," .. slot .. "," .. min_samples
+    if st.hcfg ~= hcfg_str then
+        if dict:set("rb:" .. name .. ":hcfg", hcfg_str) then
+            st.hcfg = hcfg_str
+        end
+    end
 
     return setmetatable({ _st = st, name = name, zone = zone }, mt)
 end
@@ -262,7 +344,7 @@ function _M.record(self, ms)
     end
     local st = self._st
     local now = st.clock()
-    local slot = math.floor(now / st.slot_sec)
+    local slot = floor(now / st.slot_sec)
     ensure_keys(st, slot)
     local b = _M.bucket_of(ms)
     local newval, err, forcible = st.dict:incr(st.keys[b], 1, 0, st.ttl)
@@ -275,13 +357,14 @@ function _M.record(self, ms)
         log.warn(st.dict, st.name, "dict_full",
                  "shared dict evicted live entries", now)
     end
-    ensure_timer(st)
     return true
 end
 
 function _M.samples(self)
     local st = self._st
-    refresh(st, st.clock())
+    local now = st.clock()
+    st.last_query_at = now
+    refresh(st, now)
     ensure_timer(st)
     return st.total
 end
@@ -292,11 +375,13 @@ function _M.percentile(self, p, min_samples)
     end
     if min_samples ~= nil and (type(min_samples) ~= "number"
         or min_samples < 0
-        or min_samples ~= math.floor(min_samples)) then
+        or min_samples ~= floor(min_samples)) then
         return nil, "retry-budget: min_samples must be an integer >= 0"
     end
     local st = self._st
-    refresh(st, st.clock())
+    local now = st.clock()
+    st.last_query_at = now
+    refresh(st, now)
     ensure_timer(st)
     return quantile(st, p, min_samples)
 end

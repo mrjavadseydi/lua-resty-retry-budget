@@ -1,6 +1,10 @@
 -- Full jitter: delay is uniform in [0, min(max_ms, base_ms * 2^(attempt-1))].
 -- `attempt` is how many attempts have already failed (1 after the first failure).
 
+local match = string.match
+local tonumber = tonumber
+local type = type
+
 local _M = {}
 
 function _M.delay_ms(attempt, base_ms, max_ms, random)
@@ -31,11 +35,11 @@ function _M.retry_after_ms(header, now)
     if type(header) ~= "string" then
         return nil
     end
-    header = header:match("^[ \t]*(.-)[ \t]*$")
+    header = match(header, "^[ \t]*(.-)[ \t]*$")
     if header == "" then
         return nil
     end
-    if header:match("^%d+$") then
+    if match(header, "^%d+$") then
         return tonumber(header) * 1000
     end
     local n = ngx
